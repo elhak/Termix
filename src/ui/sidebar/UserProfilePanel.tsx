@@ -1,5 +1,4 @@
 import { useState, useRef, useEffect } from "react";
-import { Zap } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { copyToClipboard } from "@/lib/clipboard";
 import {
@@ -38,6 +37,12 @@ import { shouldForceLocalPreferenceStorage } from "@/settings/remote-sync-state"
 import { C2STunnelPresetManager } from "@/user/C2STunnelPresetManager";
 import { Button } from "@/components/button";
 import { Input } from "@/components/input";
+import {
+  MAX_TRANSFER_CONCURRENCY,
+  TRANSFER_CONCURRENCY_STORAGE_KEY,
+  getTransferConcurrency,
+  setTransferConcurrency,
+} from "@/features/file-manager/local-transfer-utils";
 import { VersionBadge } from "@/components/version-badge";
 import {
   Dialog,
@@ -89,7 +94,6 @@ import type { FontSizeId, ThemeId, UiFontId } from "@/types/ui-types";
 import { toast } from "sonner";
 import { changeAppLanguage, normalizeLanguageCode } from "@/i18n/i18n";
 import { Select2 } from "@/components/select2";
-import type { ElectronAiSettings } from "@/types/electron";
 import { clearLocalAdaptivePreferences } from "@/lib/local-adaptive-preferences";
 import { ConnectionDefaultsSettings } from "./ConnectionDefaultsSettings";
 
@@ -98,7 +102,6 @@ type UserProfileSection =
   | "interface"
   | "appearance"
   | "security"
-  | "ai"
   | "api-keys"
   | "data"
   | "c2s-tunnels";
@@ -153,17 +156,6 @@ const LANGUAGES = [
   { code: "uk", label: "Українська" },
   { code: "vi", label: "Tiếng Việt" },
 ];
-
-const DEFAULT_AI_SETTINGS: ElectronAiSettings = {
-  enabled: false,
-  provider: "openai-compatible",
-  baseUrl: "https://api.openai.com/v1",
-  model: "gpt-4.1-mini",
-  includeContext: true,
-  hasApiKey: false,
-  apiKey: "",
-  secureStorageAvailable: false,
-};
 
 export function AccordionSection({
   id,
@@ -531,6 +523,7 @@ export function UserProfilePanel({
     compactHostView?: boolean | null;
     pinAppRail?: boolean | null;
     expandAppRailOnHover?: boolean | null;
+    showPinAppRailButton?: boolean | null;
     foldersCollapsed?: boolean | null;
     confirmSnippetExecution?: boolean | null;
     disableUpdateCheck?: boolean | null;
@@ -692,6 +685,9 @@ export function UserProfilePanel({
   const [terminalLinkClickBehavior, setTerminalLinkClickBehavior] = useState(
     () => localStorage.getItem("terminalLinkClickBehavior") ?? "confirm",
   );
+  const [transferConcurrency, setTransferConcurrencyState] = useState(() =>
+    getTransferConcurrency(),
+  );
   const [commandPaletteEnabled, setCommandPaletteEnabled] = useState(() => {
     const v = localStorage.getItem("commandPaletteShortcutEnabled");
     return v !== null ? v === "true" : true;
@@ -754,6 +750,9 @@ export function UserProfilePanel({
   const [expandAppRailOnHover, setExpandAppRailOnHover] = useState(() =>
     readRailPreference("expandAppRailOnHover"),
   );
+  const [showPinAppRailButton, setShowPinAppRailButton] = useState(() =>
+    readRailPreference("showPinAppRailButton"),
+  );
   // Read values are unused now that the Snippets settings UI lives in
   // SnippetsPanel.tsx; the setters still back the cloud-sync/reset/snapshot
   // machinery for these two localStorage-backed prefs below.
@@ -780,14 +779,6 @@ export function UserProfilePanel({
 
   // API keys
   const [apiKeys, setApiKeys] = useState<ApiKey[]>([]);
-
-  // Local Electron AI settings
-  const [aiSettings, setAiSettings] =
-    useState<ElectronAiSettings>(DEFAULT_AI_SETTINGS);
-  const [aiApiKey, setAiApiKey] = useState("");
-  const [aiLoading, setAiLoading] = useState(false);
-  const [aiSaving, setAiSaving] = useState(false);
-  const [aiTesting, setAiTesting] = useState(false);
 
   // RBAC roles
   const [userRoles, setUserRoles] = useState<UserRole[]>([]);
@@ -846,29 +837,22 @@ export function UserProfilePanel({
     const pinHandler = () => setPinAppRail(readRailPreference("pinAppRail"));
     const hoverHandler = () =>
       setExpandAppRailOnHover(readRailPreference("expandAppRailOnHover"));
+    const showPinButtonHandler = () =>
+      setShowPinAppRailButton(readRailPreference("showPinAppRailButton"));
     window.addEventListener("pinAppRailChanged", pinHandler);
     window.addEventListener("expandAppRailOnHoverChanged", hoverHandler);
+    window.addEventListener(
+      "showPinAppRailButtonChanged",
+      showPinButtonHandler,
+    );
     return () => {
       window.removeEventListener("pinAppRailChanged", pinHandler);
       window.removeEventListener("expandAppRailOnHoverChanged", hoverHandler);
+      window.removeEventListener(
+        "showPinAppRailButtonChanged",
+        showPinButtonHandler,
+      );
     };
-  }, []);
-
-  useEffect(() => {
-    if (!isElectron() || !window.electronAPI?.getAiSettings) {
-      return;
-    }
-
-    setAiLoading(true);
-    window.electronAPI
-      .getAiSettings()
-      .then((result) => {
-        if (result.success && result.settings) {
-          setAiSettings(result.settings);
-        }
-      })
-      .catch(() => {})
-      .finally(() => setAiLoading(false));
   }, []);
 
   function saveToCloud(prefs: Parameters<typeof saveUserPreferences>[0]) {
@@ -892,6 +876,7 @@ export function UserProfilePanel({
         "compactHostView",
         "pinAppRail",
         "expandAppRailOnHover",
+        "showPinAppRailButton",
         "defaultSnippetFoldersCollapsed",
         "snippetShowCommands",
         "confirmSnippetExecution",
@@ -906,6 +891,7 @@ export function UserProfilePanel({
         "dashboardTab.mainWidthPct",
         "termix-terminal-toolbar-density",
         "fileManagerViewMode",
+        TRANSFER_CONCURRENCY_STORAGE_KEY,
       ];
       const snap: Record<string, string | null> = { __theme: theme };
       for (const key of SNAPSHOT_KEYS) snap[key] = localStorage.getItem(key);
@@ -964,6 +950,14 @@ export function UserProfilePanel({
             String(prefs.expandAppRailOnHover),
           );
           window.dispatchEvent(new Event("expandAppRailOnHoverChanged"));
+        }
+        if (prefs.showPinAppRailButton != null) {
+          setShowPinAppRailButton(prefs.showPinAppRailButton);
+          localStorage.setItem(
+            "showPinAppRailButton",
+            String(prefs.showPinAppRailButton),
+          );
+          window.dispatchEvent(new Event("showPinAppRailButtonChanged"));
         }
         if (prefs.foldersCollapsed != null) {
           setFoldersCollapsed(prefs.foldersCollapsed);
@@ -1043,6 +1037,9 @@ export function UserProfilePanel({
     setExpandAppRailOnHover(true);
     localStorage.setItem("expandAppRailOnHover", "true");
     window.dispatchEvent(new Event("expandAppRailOnHoverChanged"));
+    setShowPinAppRailButton(false);
+    localStorage.setItem("showPinAppRailButton", "false");
+    window.dispatchEvent(new Event("showPinAppRailButtonChanged"));
     setFoldersCollapsed(true);
     localStorage.removeItem("defaultSnippetFoldersCollapsed");
     setConfirmSnippetExecution(false);
@@ -1067,6 +1064,7 @@ export function UserProfilePanel({
         commandPaletteEnabled: true,
         pinAppRail: false,
         expandAppRailOnHover: true,
+        showPinAppRailButton: false,
         foldersCollapsed: true,
         confirmSnippetExecution: false,
         disableUpdateCheck: false,
@@ -1150,6 +1148,12 @@ export function UserProfilePanel({
     );
     window.dispatchEvent(new Event("expandAppRailOnHoverChanged"));
 
+    const restoredShowPinButton =
+      restore("showPinAppRailButton", "false") === "true";
+    setShowPinAppRailButton(restoredShowPinButton);
+    localStorage.setItem("showPinAppRailButton", String(restoredShowPinButton));
+    window.dispatchEvent(new Event("showPinAppRailButtonChanged"));
+
     const restoredFolders =
       restore("defaultSnippetFoldersCollapsed", null) !== "false";
     setFoldersCollapsed(restoredFolders);
@@ -1230,94 +1234,6 @@ export function UserProfilePanel({
         if (storageMode === "cloud") saveToCloud({ language });
       })
       .catch(() => {});
-  }
-
-  async function handleSaveAiSettings() {
-    if (!window.electronAPI?.saveAiSettings) {
-      toast.error(t("newUi.sidebar.userProfile.aiDesktopOnly"));
-      return;
-    }
-
-    setAiSaving(true);
-    try {
-      const result = await window.electronAPI.saveAiSettings({
-        enabled: aiSettings.enabled,
-        baseUrl: aiSettings.baseUrl,
-        model: aiSettings.model,
-        includeContext: aiSettings.includeContext,
-        apiKey: aiApiKey.trim() || undefined,
-      });
-      if (!result.success || !result.settings) {
-        throw new Error(result.error || "Failed to save AI settings");
-      }
-      setAiSettings(result.settings);
-      setAiApiKey("");
-      toast.success(t("newUi.sidebar.userProfile.aiSettingsSaved"));
-    } catch (error) {
-      toast.error(
-        error instanceof Error
-          ? error.message
-          : t("newUi.sidebar.userProfile.aiSettingsSaveFailed"),
-      );
-    } finally {
-      setAiSaving(false);
-    }
-  }
-
-  async function handleTestAiSettings() {
-    if (!window.electronAPI?.testAiSettings) {
-      toast.error(t("newUi.sidebar.userProfile.aiDesktopOnly"));
-      return;
-    }
-
-    setAiTesting(true);
-    try {
-      const result = await window.electronAPI.testAiSettings({
-        enabled: aiSettings.enabled,
-        baseUrl: aiSettings.baseUrl,
-        model: aiSettings.model,
-        includeContext: aiSettings.includeContext,
-        apiKey: aiApiKey.trim() || undefined,
-      });
-      if (!result.success) {
-        throw new Error(result.error || "AI settings test failed");
-      }
-      toast.success(t("newUi.sidebar.userProfile.aiTestSuccess"));
-    } catch (error) {
-      toast.error(
-        error instanceof Error
-          ? error.message
-          : t("newUi.sidebar.userProfile.aiTestFailed"),
-      );
-    } finally {
-      setAiTesting(false);
-    }
-  }
-
-  async function handleClearAiSettings() {
-    if (!window.electronAPI?.clearAiSettings) {
-      toast.error(t("newUi.sidebar.userProfile.aiDesktopOnly"));
-      return;
-    }
-
-    setAiSaving(true);
-    try {
-      const result = await window.electronAPI.clearAiSettings();
-      if (!result.success || !result.settings) {
-        throw new Error(result.error || "Failed to clear AI settings");
-      }
-      setAiSettings(result.settings);
-      setAiApiKey("");
-      toast.success(t("newUi.sidebar.userProfile.aiClearSuccess"));
-    } catch (error) {
-      toast.error(
-        error instanceof Error
-          ? error.message
-          : t("newUi.sidebar.userProfile.aiClearFailed"),
-      );
-    } finally {
-      setAiSaving(false);
-    }
   }
 
   function toggle(id: UserProfileSection) {
@@ -2103,6 +2019,31 @@ export function UserProfilePanel({
                 </option>
               </Select2>
             </div>
+            <div className="flex flex-col gap-1.5 py-3 border-b border-border">
+              <div className="flex flex-col gap-0.5">
+                <span className="text-sm font-medium leading-snug">
+                  {t("newUi.sidebar.userProfile.transferConcurrency")}
+                </span>
+                <span className="text-xs text-muted-foreground leading-snug">
+                  {t("newUi.sidebar.userProfile.transferConcurrencyDesc")}
+                </span>
+              </div>
+              <Select2
+                value={transferConcurrency}
+                onChange={(e) =>
+                  setTransferConcurrencyState(
+                    setTransferConcurrency(Number(e.target.value)),
+                  )
+                }
+                className="h-7 border border-border bg-background px-2 text-xs outline-none focus:ring-1 focus:ring-ring"
+              >
+                {Array.from({ length: MAX_TRANSFER_CONCURRENCY }, (_, i) => (
+                  <option key={i + 1} value={i + 1}>
+                    {i + 1}
+                  </option>
+                ))}
+              </Select2>
+            </div>
             <SettingRow
               label={t("newUi.sidebar.userProfile.commandPalette")}
               description={t("newUi.sidebar.userProfile.commandPaletteDesc")}
@@ -2213,6 +2154,20 @@ export function UserProfilePanel({
                 onChange={(v) => {
                   setExpandAppRailOnHover(v);
                   setRailPreference("expandAppRailOnHover", v);
+                }}
+              />
+            </SettingRow>
+            <SettingRow
+              label={t("newUi.sidebar.userProfile.showPinAppRailButton")}
+              description={t(
+                "newUi.sidebar.userProfile.showPinAppRailButtonDesc",
+              )}
+            >
+              <FakeSwitch
+                checked={showPinAppRailButton}
+                onChange={(v) => {
+                  setShowPinAppRailButton(v);
+                  setRailPreference("showPinAppRailButton", v);
                 }}
               />
             </SettingRow>
@@ -2686,159 +2641,6 @@ export function UserProfilePanel({
               setShowPassword={setShowPassword}
               onLogout={onLogout}
             />
-          )}
-        </div>
-      </AccordionSection>
-
-      {/* AI */}
-      <AccordionSection
-        id="ai"
-        label={t("newUi.sidebar.userProfile.sectionAi")}
-        icon={<Zap className="size-3.5" />}
-        open={openSections.has("ai")}
-        onToggle={() => toggle("ai")}
-      >
-        <div className="flex flex-col gap-3 pt-3">
-          {!isElectron() ? (
-            <div className="border border-border bg-muted/30 px-3 py-3 text-xs text-muted-foreground leading-relaxed">
-              {t("newUi.sidebar.userProfile.aiDesktopOnly")}
-            </div>
-          ) : (
-            <>
-              <SettingRow
-                label={t("newUi.sidebar.userProfile.aiEnable")}
-                description={t("newUi.sidebar.userProfile.aiEnableDesc")}
-              >
-                <FakeSwitch
-                  checked={aiSettings.enabled}
-                  onChange={(enabled) =>
-                    setAiSettings((prev) => ({ ...prev, enabled }))
-                  }
-                  disabled={aiLoading}
-                />
-              </SettingRow>
-
-              <div className="grid grid-cols-1 gap-2">
-                <label className="flex flex-col gap-1">
-                  <span className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
-                    {t("newUi.sidebar.userProfile.aiBaseUrl")}
-                  </span>
-                  <Input
-                    value={aiSettings.baseUrl}
-                    onChange={(event) =>
-                      setAiSettings((prev) => ({
-                        ...prev,
-                        baseUrl: event.target.value,
-                      }))
-                    }
-                    placeholder="https://api.openai.com/v1"
-                    className="h-8 text-xs"
-                    disabled={aiLoading}
-                  />
-                </label>
-
-                <label className="flex flex-col gap-1">
-                  <span className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
-                    {t("newUi.sidebar.userProfile.aiModel")}
-                  </span>
-                  <Input
-                    value={aiSettings.model}
-                    onChange={(event) =>
-                      setAiSettings((prev) => ({
-                        ...prev,
-                        model: event.target.value,
-                      }))
-                    }
-                    placeholder="gpt-4.1-mini"
-                    className="h-8 text-xs"
-                    disabled={aiLoading}
-                  />
-                </label>
-
-                <label className="flex flex-col gap-1">
-                  <span className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
-                    {t("newUi.sidebar.userProfile.aiApiKey")}
-                  </span>
-                  <Input
-                    type="password"
-                    value={aiApiKey}
-                    onChange={(event) => setAiApiKey(event.target.value)}
-                    placeholder={
-                      aiSettings.hasApiKey && aiSettings.apiKey
-                        ? aiSettings.apiKey
-                        : "sk-..."
-                    }
-                    className="h-8 text-xs"
-                    disabled={aiLoading || !aiSettings.secureStorageAvailable}
-                  />
-                  <span className="text-[10px] text-muted-foreground leading-relaxed">
-                    {aiSettings.secureStorageAvailable
-                      ? aiSettings.hasApiKey
-                        ? t("newUi.sidebar.userProfile.aiKeySaved")
-                        : t("newUi.sidebar.userProfile.aiApiKeyDesc")
-                      : t(
-                          "newUi.sidebar.userProfile.aiSecureStorageUnavailable",
-                        )}
-                  </span>
-                </label>
-              </div>
-
-              <SettingRow
-                label={t("newUi.sidebar.userProfile.aiIncludeContext")}
-                description={t(
-                  "newUi.sidebar.userProfile.aiIncludeContextDesc",
-                )}
-              >
-                <FakeSwitch
-                  checked={aiSettings.includeContext}
-                  onChange={(includeContext) =>
-                    setAiSettings((prev) => ({ ...prev, includeContext }))
-                  }
-                  disabled={aiLoading}
-                />
-              </SettingRow>
-
-              <div className="flex flex-wrap gap-2 pt-1">
-                <Button
-                  size="sm"
-                  className="h-7 text-[10px] font-bold uppercase tracking-widest"
-                  onClick={handleSaveAiSettings}
-                  disabled={
-                    aiSaving ||
-                    aiLoading ||
-                    (!aiSettings.secureStorageAvailable && !!aiApiKey.trim())
-                  }
-                >
-                  {aiSaving
-                    ? t("common.saving")
-                    : t("newUi.sidebar.userProfile.aiSave")}
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-7 text-[10px] font-bold uppercase tracking-widest"
-                  onClick={handleTestAiSettings}
-                  disabled={
-                    aiTesting ||
-                    aiLoading ||
-                    (!aiSettings.hasApiKey && !aiApiKey.trim())
-                  }
-                >
-                  {aiTesting
-                    ? t("newUi.sidebar.userProfile.aiTesting")
-                    : t("newUi.sidebar.userProfile.aiTest")}
-                </Button>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="h-7 text-[10px] font-bold uppercase tracking-widest text-muted-foreground hover:text-destructive"
-                  onClick={handleClearAiSettings}
-                  disabled={aiSaving || aiLoading}
-                >
-                  {t("newUi.sidebar.userProfile.aiClear")}
-                </Button>
-              </div>
-            </>
           )}
         </div>
       </AccordionSection>

@@ -19,6 +19,7 @@ import {
   useRef,
   useCallback,
   useEffect,
+  useLayoutEffect,
   createRef,
   lazy,
   Suspense,
@@ -656,6 +657,10 @@ export function AppShell({
   // target never changes (changing the target causes a remount).
   const tabNodesRef = useRef<Map<string, HTMLDivElement>>(new Map());
   const normalViewRef = useRef<HTMLDivElement>(null);
+  // Tab id the enter animation has already played for, so a re-render while
+  // the tab stays active (there can be several right after a switch) doesn't
+  // replay it — only a genuine switch to a different tab should.
+  const lastAnimatedTabIdRef = useRef<string | null>(null);
 
   const getTabNode = useCallback((tabId: string, isTerminal: boolean) => {
     if (!tabNodesRef.current.has(tabId)) {
@@ -668,6 +673,30 @@ export function AppShell({
     }
     return tabNodesRef.current.get(tabId)!;
   }, []);
+
+  // Portal render order for tab content, kept independent of the tab bar's
+  // visual order. Reordering tabs in the bar reorders `tabs`, and mapping
+  // that array directly to portals reshuffles the Suspense-wrapped portal
+  // children's sibling order in the fiber tree — React then runs its
+  // Offscreen disconnect/reconnect pass on the ones that moved, which tears
+  // down and rebuilds every passive effect underneath (including
+  // react-xtermjs's terminal-creation effect), dropping the live terminal
+  // and its WebSocket. Portal position doesn't need to track tab order at
+  // all, so we only ever append new ids and drop closed ones here.
+  const portalOrderRef = useRef<string[]>([]);
+  {
+    const liveIds = new Set(tabs.map((t) => t.id));
+    portalOrderRef.current = portalOrderRef.current.filter((id) =>
+      liveIds.has(id),
+    );
+    const known = new Set(portalOrderRef.current);
+    for (const tab of tabs) {
+      if (!known.has(tab.id)) portalOrderRef.current.push(tab.id);
+    }
+  }
+  const tabsByPortalOrder = portalOrderRef.current
+    .map((id) => tabs.find((t) => t.id === id))
+    .filter((t): t is Tab => t !== undefined);
 
   const onPaneContentRef = useCallback(
     (paneIndex: number, el: HTMLDivElement | null) => {
@@ -1759,6 +1788,7 @@ export function AppShell({
       enableProxmoxStats: false,
       enableTmuxMonitor: false,
       enableTerminalToolbar: false,
+      enableAiAssistant: false,
       enableSsh: false,
       enableRdp: false,
       enableVnc: false,
@@ -1817,7 +1847,7 @@ export function AppShell({
     const check = async () => {
       try {
         const { listCollabRooms } = await import("@/api/collab-api");
-        const { rooms } = await listCollabRooms();
+        const { rooms = [] } = await listCollabRooms();
         if (cancelled) return;
         let seen: string[] = [];
         try {
@@ -2351,7 +2381,10 @@ export function AppShell({
   // Move each tab's stable DOM node to the right container (pane or normal-view).
   // This is vanilla DOM so React's portal target never changes — changing the portal
   // target causes a remount which is exactly what we're trying to avoid.
-  useEffect(() => {
+  // useLayoutEffect (not useEffect) so visibility/display are corrected before
+  // the browser paints — otherwise the previous tab's node can flash on screen
+  // for a frame while still visible.
+  useLayoutEffect(() => {
     const normalView = normalViewRef.current;
     if (!normalView) return;
 
@@ -2380,6 +2413,7 @@ export function AppShell({
         node.style.pointerEvents = "auto";
         node.style.display = "";
         node.style.zIndex = "";
+        node.style.contentVisibility = "";
       } else {
         if (node.parentElement !== normalView) normalView.appendChild(node);
         if (isTerminal) {
@@ -2387,8 +2421,37 @@ export function AppShell({
           node.style.visibility = activeInline ? "visible" : "hidden";
           node.style.pointerEvents = activeInline ? "auto" : "none";
           node.style.zIndex = activeInline ? "1" : "0";
+          // xterm renders to a <canvas>; visibility:hidden alone can still let
+          // a stale composited frame flash through for a tick when switching
+          // to/from a non-terminal tab. content-visibility:hidden fully skips
+          // painting the subtree while keeping its layout box intact, so
+          // fitAddon.fit() still sees correct dimensions once it's shown again.
+          node.style.contentVisibility = activeInline ? "" : "hidden";
         } else {
-          node.classList.toggle("motion-workspace-enter", activeInline);
+          // Plays a quick opacity fade-in on the tab that just became active.
+          // Only play it on an actual switch into this tab -- gating on the
+          // class alone replayed the animation on every unrelated re-render
+          // that happened while the tab was still active (any render after
+          // animationend had stripped the class), which looked like the
+          // panel kept growing for up to a second after switching.
+          if (activeInline && lastAnimatedTabIdRef.current !== tab.id) {
+            lastAnimatedTabIdRef.current = tab.id;
+            node.classList.remove("motion-workspace-enter");
+            // Force a reflow so re-adding the class restarts the animation
+            // instead of no-oping because it was already removed this tick.
+            void node.offsetWidth;
+            node.classList.add("motion-workspace-enter");
+            node.addEventListener(
+              "animationend",
+              () => node.classList.remove("motion-workspace-enter"),
+              { once: true },
+            );
+          } else if (!activeInline) {
+            node.classList.remove("motion-workspace-enter");
+            if (lastAnimatedTabIdRef.current === tab.id) {
+              lastAnimatedTabIdRef.current = null;
+            }
+          }
           node.style.visibility = "";
           node.style.pointerEvents = "";
           node.style.zIndex = activeInline ? "2" : "";
@@ -2664,6 +2727,7 @@ export function AppShell({
                   enableProxmoxStats: false,
                   enableTmuxMonitor: false,
                   enableTerminalToolbar: false,
+                  enableAiAssistant: false,
                   enableSsh: false,
                   enableRdp: false,
                   enableVnc: false,
@@ -2719,6 +2783,7 @@ export function AppShell({
                   enableProxmoxStats: false,
                   enableTmuxMonitor: false,
                   enableTerminalToolbar: false,
+                  enableAiAssistant: false,
                   enableSsh: false,
                   enableRdp: false,
                   enableVnc: false,
@@ -3056,7 +3121,7 @@ export function AppShell({
                     display: isSplit && !isMobile ? "none" : undefined,
                   }}
                 >
-                  {tabs.map((tab) => {
+                  {tabsByPortalOrder.map((tab) => {
                     const tabNode = getTabNode(
                       tab.id,
                       tab.type === "terminal" || tab.type === "local-terminal",
