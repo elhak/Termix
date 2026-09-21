@@ -34,7 +34,7 @@ import type { FileItem } from "@/types/index";
 import type { CreateIntent } from "./file-manager-types.ts";
 import { formatFileSize } from "./file-manager-utils.ts";
 import {
-  REMOTE_FILES_DRAG_MIME,
+  beginRemoteFilesDrag,
   isLocalFilesDrag,
   parseLocalFilesDragPayload,
 } from "./local-transfer-utils.ts";
@@ -415,14 +415,10 @@ export function FileManagerGrid({
       mousePosition: { x: e.clientX, y: e.clientY },
     });
 
-    const dragData = {
-      type: "internal_files",
-      files: filesToDrag.map((f) => f.path),
-    };
-    e.dataTransfer.setData("text/plain", JSON.stringify(dragData));
-    // Lets sibling panes recognise this drag before the payload is readable.
-    e.dataTransfer.setData(REMOTE_FILES_DRAG_MIME, "1");
-    e.dataTransfer.effectAllowed = "move";
+    beginRemoteFilesDrag(
+      e.dataTransfer,
+      filesToDrag.map((f) => f.path),
+    );
   };
 
   const handleFileDragOver = (e: React.DragEvent, targetFile: FileItem) => {
@@ -1085,7 +1081,7 @@ export function FileManagerGrid({
     ? {
         onClick: (e: React.MouseEvent) => {
           e.stopPropagation();
-          if (e.detail === 2) onNavigateUp?.();
+          onNavigateUp?.();
         },
         onDoubleClick: (e: React.MouseEvent) => e.stopPropagation(),
         onContextMenu: (e: React.MouseEvent) => {
@@ -1124,25 +1120,25 @@ export function FileManagerGrid({
       </div>
     ) : null;
 
-  const parentGridTile =
+  const parentGridStrip =
     parentEntry && parentEntryHandlers ? (
       <div
         data-parent-entry
         title={t("fileManager.goToParentFolder")}
         className={cn(
-          "group flex flex-col items-center rounded-none border-2 border-transparent transition-all cursor-pointer hover:bg-muted/50 select-none",
-          compact ? "p-1.5" : "p-3",
+          "flex items-center gap-2 rounded-none border border-transparent transition-colors cursor-pointer hover:bg-muted/50 select-none",
+          compact
+            ? "-mx-2 -mt-2 px-2 py-1 text-[11px]"
+            : "-mx-4 -mt-4 px-4 py-1.5 text-xs",
           isParentTarget &&
             "bg-accent-brand/20 border-accent-brand border-dashed",
         )}
         {...parentEntryHandlers}
       >
-        <div className="relative mb-2 pointer-events-none">
-          <CornerLeftUp className="size-12 text-muted-foreground" />
-        </div>
-        <p className="text-[11px] font-bold tracking-tight text-center text-muted-foreground pointer-events-none">
+        <CornerLeftUp className="size-3.5 text-muted-foreground pointer-events-none" />
+        <span className="font-bold tracking-tight text-muted-foreground pointer-events-none">
           ..
-        </p>
+        </span>
       </div>
     ) : null;
 
@@ -1169,23 +1165,9 @@ export function FileManagerGrid({
           onContextMenu={(e) => onContextMenu?.(e)}
           tabIndex={0}
         >
-          {(dragState.type === "external" ||
-            (dragState.type === "local" && !dragState.target)) && (
-            <div className="absolute inset-0 flex items-center justify-center bg-background/50 z-10 pointer-events-none">
-              <div className="text-center p-8 bg-card/95 border border-accent-brand/40 flex flex-col items-center gap-4">
-                <Upload className="size-12 text-accent-brand" />
-                <p className="text-[10px] font-bold uppercase tracking-widest text-accent-brand">
-                  {dragState.type === "local"
-                    ? t("fileManager.dropToUploadHere")
-                    : t("fileManager.dragFilesToUpload")}
-                </p>
-              </div>
-            </div>
-          )}
-
           {files.length === 0 && !createIntent ? (
             <div className="h-full flex flex-col">
-              {parentListRow}
+              {viewMode === "grid" ? parentGridStrip : parentListRow}
               <div className="flex-1 flex flex-col items-center justify-center text-muted-foreground opacity-10 gap-4 select-none pointer-events-none">
                 <Folder className="size-32" strokeWidth={1} />
                 <span className="text-2xl font-black uppercase tracking-[0.2em]">
@@ -1195,21 +1177,19 @@ export function FileManagerGrid({
             </div>
           ) : viewMode === "grid" ? (
             <div className={cn("flex flex-col", compact ? "gap-2" : "gap-4")}>
-              {(createIntent || parentGridTile) && (
+              {parentGridStrip}
+              {createIntent && (
                 <div
                   className={cn("grid", compact ? "gap-2" : "gap-4")}
                   style={{
                     gridTemplateColumns: `repeat(${gridCols}, minmax(0, 1fr))`,
                   }}
                 >
-                  {parentGridTile}
-                  {createIntent && (
-                    <CreateIntentGridItem
-                      intent={createIntent}
-                      onConfirm={onConfirmCreate}
-                      onCancel={onCancelCreate}
-                    />
-                  )}
+                  <CreateIntentGridItem
+                    intent={createIntent}
+                    onConfirm={onConfirmCreate}
+                    onCancel={onCancelCreate}
+                  />
                 </div>
               )}
               <div
@@ -1562,6 +1542,24 @@ export function FileManagerGrid({
             />
           )}
         </div>
+
+        {/* Sibling of the scroll container, not a child: an absolutely
+            positioned child of a scroll container scrolls away with the
+            content, so the hint would land above the viewport whenever the
+            list is scrolled down. */}
+        {(dragState.type === "external" ||
+          (dragState.type === "local" && !dragState.target)) && (
+          <div className="absolute inset-0 flex items-center justify-center bg-background/50 z-10 pointer-events-none">
+            <div className="text-center p-8 bg-card/95 border border-accent-brand/40 flex flex-col items-center gap-4">
+              <Upload className="size-12 text-accent-brand" />
+              <p className="text-[10px] font-bold uppercase tracking-widest text-accent-brand">
+                {dragState.type === "local"
+                  ? t("fileManager.dropToUploadHere")
+                  : t("fileManager.dragFilesToUpload")}
+              </p>
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="px-4 py-1.5 bg-muted/30 border-t border-border flex items-center justify-between text-[10px] font-bold uppercase tracking-widest text-muted-foreground shrink-0">

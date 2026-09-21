@@ -40,6 +40,7 @@ import { collectLoginStats } from "./widgets/login-stats-collector.js";
 import { collectPortsMetrics } from "./widgets/ports-collector.js";
 import { collectFirewallMetrics } from "./widgets/firewall-collector.js";
 import { collectTemperatureMetrics } from "./widgets/temperature-collector.js";
+import { collectGpuMetrics, type GpuMetrics } from "./widgets/gpu-collector.js";
 import {
   createSocks5Connection,
   type SOCKS5Config,
@@ -54,13 +55,14 @@ import { registerHostMetricsHistoryRoutes } from "./history-routes.js";
 import { registerProxmoxStatsRoutes } from "./proxmox-stats-routes.js";
 import { registerProxmoxStatsHistoryRoutes } from "./proxmox-stats-history-routes.js";
 import { ProxmoxPollingManager } from "./proxmox-stats-polling.js";
-import { hostSessionStatus } from "../terminal/host-session-status.js";
+// PLUGIN-EVENT: terminal session online/offline -> phase-2 ctx.events "host.session.status" topic
+import { hostSessionStatus } from "../host-session-status.js";
 import { AlertEngine } from "./alert-engine.js";
 import {
-  notifyAutomationInternalEvent,
   notifyAutomationMetrics,
   notifyAutomationStatus,
 } from "./automation-bridge.js";
+import { notifyAutomationInternalEvent } from "../automation-events.js";
 import { registerManagerRoutes } from "./managers/index.js";
 import { resolveSshConnectConfigHost } from "../ssh-dns.js";
 import { AccessDeniedError } from "./managers/route-helpers.js";
@@ -217,6 +219,8 @@ class PollingManager {
   private unsubscribeHostSessionStatus: () => void;
 
   constructor() {
+    // PLUGIN-EVENT: subscribe to ctx.events.on("host.session.status", ...) once the
+    // phase-2 event bus exists, instead of the hostSessionStatus singleton directly.
     this.unsubscribeHostSessionStatus = hostSessionStatus.subscribe(
       (hostId, online) => this.setTerminalSessionOnline(hostId, online),
     );
@@ -1857,6 +1861,13 @@ async function collectMetrics(
           // expected
         }
 
+        let gpu: GpuMetrics = { source: "none", gpus: [], processes: [] };
+        try {
+          gpu = await collectGpuMetrics(client);
+        } catch {
+          // expected
+        }
+
         const result = {
           cpu,
           memory,
@@ -1869,6 +1880,7 @@ async function collectMetrics(
           ports,
           firewall,
           temperature,
+          gpu,
         };
 
         metricsCache.set(host.id, result);

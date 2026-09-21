@@ -72,6 +72,27 @@ export function isLocalFilesDrag(
   return Array.from(dataTransfer.types ?? []).includes(LOCAL_FILES_DRAG_MIME);
 }
 
+/**
+ * Marks a drag that starts on remote rows. Within the remote grid a drop is a
+ * move; onto the local pane it is a copy (a download). The source has to
+ * allow both, because Chromium refuses a drop whose dropEffect is not in
+ * effectAllowed without firing any event at all -- the drop just silently
+ * does nothing.
+ */
+export function beginRemoteFilesDrag(
+  dataTransfer: Pick<DataTransfer, "setData" | "effectAllowed">,
+  remotePaths: string[],
+): void {
+  const payload: InternalFilesDragPayload = {
+    type: "internal_files",
+    files: remotePaths,
+  };
+  dataTransfer.setData("text/plain", JSON.stringify(payload));
+  // Lets sibling panes recognise this drag before the payload is readable.
+  dataTransfer.setData(REMOTE_FILES_DRAG_MIME, "1");
+  dataTransfer.effectAllowed = "copyMove";
+}
+
 /** True while a drag that started in the remote grid is over the element. */
 export function isRemoteFilesDrag(
   dataTransfer: Pick<DataTransfer, "types"> | null | undefined,
@@ -329,4 +350,64 @@ export function formatLocalModified(
     return `${month} ${day} ${hours}:${minutes}`;
   }
   return `${month} ${day}  ${date.getFullYear()}`;
+}
+
+// ---------------------------------------------------------------------------
+// Parallel transfers
+
+export const TRANSFER_CONCURRENCY_STORAGE_KEY =
+  "termix:file-manager:transfer-concurrency";
+export const DEFAULT_TRANSFER_CONCURRENCY = 4;
+export const MAX_TRANSFER_CONCURRENCY = 8;
+
+export function clampTransferConcurrency(value: unknown): number {
+  const n = Math.floor(Number(value));
+  if (!Number.isFinite(n)) return DEFAULT_TRANSFER_CONCURRENCY;
+  return Math.min(MAX_TRANSFER_CONCURRENCY, Math.max(1, n));
+}
+
+/** How many files are transferred at the same time (1 = one after another). */
+export function getTransferConcurrency(): number {
+  try {
+    const raw = localStorage.getItem(TRANSFER_CONCURRENCY_STORAGE_KEY);
+    return raw === null
+      ? DEFAULT_TRANSFER_CONCURRENCY
+      : clampTransferConcurrency(raw);
+  } catch {
+    return DEFAULT_TRANSFER_CONCURRENCY;
+  }
+}
+
+export function setTransferConcurrency(value: number): number {
+  const clamped = clampTransferConcurrency(value);
+  try {
+    localStorage.setItem(TRANSFER_CONCURRENCY_STORAGE_KEY, String(clamped));
+  } catch {
+    // storage unavailable
+  }
+  return clamped;
+}
+
+/**
+ * Runs `worker` over `items` with at most `limit` in flight, preserving the
+ * original order of dispatch. Stops dispatching new items once `shouldStop()`
+ * returns true; items already in flight run to completion (the caller
+ * cancels those through their own transfer ids). Never rejects because of a
+ * single item: worker errors are the worker's business.
+ */
+export async function runWithConcurrency<T>(
+  items: readonly T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<void>,
+  shouldStop: () => boolean = () => false,
+): Promise<void> {
+  const size = Math.max(1, Math.min(limit, items.length));
+  let next = 0;
+  const lanes = Array.from({ length: size }, async () => {
+    while (next < items.length && !shouldStop()) {
+      const index = next++;
+      await worker(items[index], index);
+    }
+  });
+  await Promise.all(lanes);
 }
