@@ -21,16 +21,16 @@ import {
 import { toast } from "sonner";
 import type { AdminUser } from "./AdminManagementSections";
 import { Select2 } from "@/components/select2";
+import { parseServerTime } from "@/lib/server-time";
 
 const RESOURCE_TYPES = [
   "user",
   "host",
   "credential",
-  "snippet",
+  "plugin",
   "session",
   "api_key",
   "setting",
-  "tunnel",
 ];
 
 type AdminAuditLogSectionProps = {
@@ -178,7 +178,7 @@ export function AdminAuditLogSection({
 
   function formatTimestamp(ts: string) {
     try {
-      return new Date(ts).toLocaleString(undefined, {
+      return parseServerTime(ts).toLocaleString(undefined, {
         year: "numeric",
         month: "short",
         day: "numeric",

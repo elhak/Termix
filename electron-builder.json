@@ -8,6 +8,7 @@
   "asar": true,
   "asarUnpack": [
     "dist/backend/**/*",
+    "dist/plugins/**/*",
     "node_modules/**/*",
     "public/icons/**/*",
     "public/icon.*"
@@ -61,10 +62,13 @@
     "installerIcon": "public/icon.ico",
     "uninstallerIcon": "public/icon.ico",
     "shortcutName": "Termix",
-    "uninstallDisplayName": "Termix"
+    "uninstallDisplayName": "Termix",
+    "include": "electron/installer.nsh"
   },
   "msi": {
-    "artifactName": "termix_windows_${arch}_msi.${ext}"
+    "artifactName": "termix_windows_${arch}_msi.${ext}",
+    "oneClick": false,
+    "additionalLightArgs": ["-sice:ICE57"]
   },
   "linux": {
     "artifactName": "termix_linux_${arch}_portable.${ext}",
@@ -89,7 +93,7 @@
     "desktop": {
       "entry": {
         "Name": "Termix",
-        "Comment": "Self-hosted SSH and remote desktop management. ",
+        "Comment": "Self-hosted, plugin-based server management.",
         "Keywords": "docker;ssh;terminal;telnet;self-hosted;rdp;file-management;vnc;ssh-tunnel;server-stats;termix",
         "StartupWMClass": "termix"
       }
@@ -101,7 +105,6 @@
   "deb": {
     "artifactName": "termix_linux_${arch}_deb.${ext}"
   },
-
   "mac": {
     "target": [
       {
@@ -120,7 +123,7 @@
     "entitlements": "packaging/build/entitlements.mac.plist",
     "entitlementsInherit": "packaging/build/entitlements.mac.inherit.plist",
     "type": "distribution",
-    "minimumSystemVersion": "10.15",
+    "minimumSystemVersion": "12.0",
     "mergeASARs": false,
     "singleArchFiles": "**/*.{node,bare,dylib}",
     "x64ArchFiles": "**/{*.{node,bare,dylib},node-pty/prebuilds/*/spawn-helper}"
@@ -145,5 +148,6 @@
       "NSAppleEventsUsageDescription": "Termix needs access to control other applications for terminal operations."
     }
   },
-  "generateUpdatesFilesForAllChannels": true
+  "generateUpdatesFilesForAllChannels": true,
+  "msiProjectCreated": "packaging/build/msi-shortcuts.cjs"
 }

@@ -1,20 +1,21 @@
 import type { Request, RequestHandler, Response, Router } from "express";
 import type { AuthenticatedRequest } from "../../../types/index.js";
 import { databaseLogger, sshLogger } from "../../utils/logger.js";
+import { pluginEvents, TOPICS } from "../../plugins/events.js";
 import {
-  createCurrentCommandHistoryRepository,
   createCurrentCredentialRepository,
-  createCurrentFileManagerBookmarkRepository,
   createCurrentHostFolderRepository,
   createCurrentFolderAccessRepository,
   createCurrentRecentActivityRepository,
   createCurrentRbacAccessRepository,
   createCurrentSshCredentialUsageRepository,
-  createCurrentSessionRecordingRepository,
-  createCurrentTransferRecentRepository,
-  createCurrentSyncTombstoneRepository,
 } from "../repositories/factory.js";
 import { isNonEmptyString } from "./host-normalizers.js";
+import { recompute } from "../../hosts/defaults/recompute.js";
+import {
+  folderCredentialIds,
+  setFolderCredentialDefault,
+} from "../../hosts/defaults/service.js";
 
 type HostFolderRoutesDeps = {
   authenticateJWT: RequestHandler;
@@ -23,7 +24,6 @@ type HostFolderRoutesDeps = {
   requireDeletePermission: RequestHandler;
   requireCredentialEditPermission: RequestHandler;
   requireDataAccess: RequestHandler;
-  statsServerUrl: string;
 };
 
 export function registerHostFolderRoutes(
@@ -35,7 +35,6 @@ export function registerHostFolderRoutes(
     requireDeletePermission,
     requireCredentialEditPermission,
     requireDataAccess,
-    statsServerUrl,
   }: HostFolderRoutesDeps,
 ): void {
   /**
@@ -98,6 +97,8 @@ export function registerHostFolderRoutes(
           oldName,
           newName,
         );
+        // Subfolders change parents with a rename, so their chains do too.
+        void recompute({ userIds: [userId] }).catch(() => {});
 
         res.json({
           message: "Folder renamed successfully",
@@ -145,10 +146,17 @@ export function registerHostFolderRoutes(
       }
 
       try {
-        const folders =
-          await createCurrentHostFolderRepository().listFolders(userId);
+        const [folders, credentials] = await Promise.all([
+          createCurrentHostFolderRepository().listFolders(userId),
+          folderCredentialIds(userId),
+        ]);
 
-        res.json(folders);
+        res.json(
+          folders.map((folder) => ({
+            ...folder,
+            credentialId: credentials.get(folder.id) ?? null,
+          })),
+        );
       } catch (err) {
         sshLogger.error("Failed to fetch folders", err, {
           operation: "fetch_folders",
@@ -183,6 +191,9 @@ export function registerHostFolderRoutes(
    *               credentialId:
    *                 type: integer
    *                 nullable: true
+   *               localOnly:
+   *                 type: boolean
+   *                 description: Desktop only. Keeps the folder and its hosts on this device instead of syncing them.
    *     responses:
    *       200:
    *         description: Folder metadata updated successfully.
@@ -198,7 +209,7 @@ export function registerHostFolderRoutes(
     requireDataAccess,
     async (req: Request, res: Response) => {
       const userId = (req as AuthenticatedRequest).userId;
-      const { name, color, icon, credentialId } = req.body;
+      const { name, color, icon, credentialId, localOnly } = req.body;
 
       if (!isNonEmptyString(userId) || !name) {
         return res.status(400).json({ error: "Folder name is required" });
@@ -237,8 +248,22 @@ export function registerHostFolderRoutes(
             name,
             color,
             icon,
+          );
+        if (typeof localOnly === "boolean") {
+          await createCurrentHostFolderRepository().setLocalOnly(
+            userId,
+            name,
+            localOnly,
+          );
+        }
+        if (normalizedCredentialId !== undefined) {
+          await setFolderCredentialDefault(
+            userId,
+            folder.id,
             normalizedCredentialId,
           );
+          void recompute({ userIds: [userId] }).catch(() => {});
+        }
 
         if (!created) {
           databaseLogger.info("Updating SSH folder", {
@@ -401,17 +426,7 @@ export function registerHostFolderRoutes(
         const hostIds = hostsToDelete.map((host) => host.id);
 
         if (hostIds.length > 0) {
-          await createCurrentFileManagerBookmarkRepository().deleteByHostIds(
-            hostIds,
-          );
-
-          await createCurrentTransferRecentRepository().deleteByHostIds(
-            hostIds,
-          );
-
-          await createCurrentCommandHistoryRepository().deleteByHostIds(
-            hostIds,
-          );
+          // Plugin rows tied to a host cascade on their refHost() foreign keys.
 
           await createCurrentSshCredentialUsageRepository().deleteByHostIds(
             hostIds,
@@ -424,50 +439,19 @@ export function registerHostFolderRoutes(
           await createCurrentRbacAccessRepository().deleteHostAccessForHosts(
             hostIds,
           );
-
-          await createCurrentSessionRecordingRepository().deleteByHostIds(
-            hostIds,
-          );
         }
 
-        const { hostSyncIds, folderSyncIds } =
-          await hostFolderRepository.deleteHostsAndFolderRecords(
-            userId,
-            folderName,
-          );
-        const tombstoneRepository = createCurrentSyncTombstoneRepository();
-        await tombstoneRepository.recordMany(userId, "hosts", hostSyncIds);
-        await tombstoneRepository.recordMany(
+        await hostFolderRepository.deleteHostsAndFolderRecords(
           userId,
-          "sshFolders",
-          folderSyncIds,
+          folderName,
         );
 
         try {
-          const axios = (await import("axios")).default;
           for (const host of hostsToDelete) {
-            try {
-              await axios.post(
-                `${statsServerUrl}/host-deleted`,
-                { hostId: host.id },
-                {
-                  headers: {
-                    Authorization: req.headers.authorization || "",
-                    Cookie: req.headers.cookie || "",
-                  },
-                  timeout: 5000,
-                },
-              );
-            } catch (err) {
-              sshLogger.warn("Failed to notify stats server of host deletion", {
-                operation: "folder_hosts_delete",
-                hostId: host.id,
-                error: err instanceof Error ? err.message : String(err),
-              });
-            }
+            pluginEvents.emit(TOPICS.hostDeleted, { hostId: host.id, userId });
           }
         } catch (err) {
-          sshLogger.warn("Failed to notify stats server of folder deletion", {
+          sshLogger.warn("Failed to publish host deletion events", {
             operation: "folder_hosts_delete",
             folderName,
             error: err instanceof Error ? err.message : String(err),
