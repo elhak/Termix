@@ -18,7 +18,10 @@ export interface PluginCreateInput {
   source?: string;
   registryId?: string | null;
   state?: string;
+  lastError?: string | null;
   autoUpdate?: boolean;
+  pinnedVersion?: string | null;
+  channel?: string;
   manifestJson: string;
 }
 
@@ -29,7 +32,10 @@ export interface PluginUpdateInput {
   source?: string;
   registryId?: string | null;
   state?: string;
+  lastError?: string | null;
   autoUpdate?: boolean;
+  pinnedVersion?: string | null;
+  channel?: string;
   manifestJson?: string;
 }
 
@@ -64,7 +70,10 @@ export class PluginRepository {
       source: input.source ?? "community",
       registryId: input.registryId ?? null,
       state: input.state ?? "disabled",
+      lastError: input.lastError ?? null,
       autoUpdate: input.autoUpdate ?? false,
+      pinnedVersion: input.pinnedVersion ?? null,
+      channel: input.channel ?? "stable",
       manifestJson: input.manifestJson,
       installedAt: now,
       updatedAt: now,
@@ -95,7 +104,14 @@ export class PluginRepository {
             ? existing.registryId
             : input.registryId,
         state: input.state ?? existing.state,
+        lastError:
+          input.lastError === undefined ? existing.lastError : input.lastError,
         autoUpdate: input.autoUpdate ?? existing.autoUpdate,
+        pinnedVersion:
+          input.pinnedVersion === undefined
+            ? existing.pinnedVersion
+            : input.pinnedVersion,
+        channel: input.channel ?? existing.channel,
         manifestJson: input.manifestJson ?? existing.manifestJson,
         updatedAt: now,
       },

@@ -1,3 +1,4 @@
+import i18n from "i18next";
 import {
   handleApiError,
   rbacApi,
@@ -16,7 +17,18 @@ async function getSharingTarget(hostId: number, syncId?: string | null) {
   if (!api || !syncId) return { api: rbacApi, hostId };
   const remoteHostId = await resolveRemoteHostId(syncId);
   if (remoteHostId === null) {
-    throw new Error("The synced host does not exist on the remote server");
+    throw new Error(i18n.t("errors.syncedHostMissing"));
+  }
+  return { api, hostId: remoteHostId };
+}
+
+/** A shared host's copy on a linked desktop is managed on the server. */
+async function getSharedCopyTarget(hostId: number, syncId?: string | null) {
+  if (!syncId) return { api: rbacApi, hostId };
+  const api = await getConnectedRemoteApi();
+  const remoteHostId = api ? await resolveRemoteHostId(syncId) : null;
+  if (!api || remoteHostId === null) {
+    throw new Error(i18n.t("errors.linkedServerUnreachable"));
   }
   return { api, hostId: remoteHostId };
 }
@@ -54,6 +66,13 @@ export async function updateRole(
 ): Promise<{ role: Role }> {
   try {
     const response = await rbacApi.put(`/rbac/roles/${roleId}`, roleData);
+    if (roleData.permissions) {
+      // The editing admin may hold this role, so re-read our own grants
+      // rather than leaving gated UI stale until the next reload.
+      const { notifyPermissionsChanged } =
+        await import("@/hooks/use-permissions");
+      notifyPermissionsChanged();
+    }
     return response.data;
   } catch (error) {
     throw handleApiError(error, "update role");
@@ -261,9 +280,25 @@ export async function getHostAccess(
   }
 }
 
+export interface PermissionCatalogItem {
+  permission: string;
+  /** Plugin-relative keys; resolve them with pluginKey(). */
+  titleKey: string;
+  descriptionKey: string;
+}
+
 export interface PermissionCatalogEntry {
   group: string;
   permissions: string[];
+  /** Set for a group a plugin contributed. */
+  pluginId?: string;
+  /** Core groups carry an i18n key, plugin groups their display name. */
+  labelKey?: string;
+  label?: string;
+  icon?: string;
+  /** False once the owning plugin is disabled or gone. */
+  enabled?: boolean;
+  items?: PermissionCatalogItem[];
 }
 
 export async function getPermissionsCatalog(): Promise<{
@@ -274,6 +309,21 @@ export async function getPermissionsCatalog(): Promise<{
     return response.data;
   } catch (error) {
     throw handleApiError(error, "fetch permissions catalog");
+  }
+}
+
+export interface MyPermissions {
+  permissions: string[];
+  isAdmin: boolean;
+}
+
+/** The current user's own grants, for hiding UI they could not use. */
+export async function getMyPermissions(): Promise<MyPermissions> {
+  try {
+    const response = await rbacApi.get("/rbac/permissions/me");
+    return response.data;
+  } catch (error) {
+    throw handleApiError(error, "fetch permissions");
   }
 }
 
@@ -320,14 +370,12 @@ export async function revokeHostAccess(
 export async function getHostAuthOverride(
   hostId: number,
   protocol: AuthOverrideProtocol,
-  remoteShared = false,
+  sharedCopySyncId?: string | null,
 ): Promise<{ protocol: AuthOverrideProtocol; credentialId: number | null }> {
   try {
-    const api = remoteShared ? await getConnectedRemoteApi() : rbacApi;
-    if (!api) throw new Error("Remote server is not connected");
-    const targetHostId = remoteShared ? Math.abs(hostId) : hostId;
-    const response = await api.get(
-      `/rbac/host-access/${targetHostId}/auth/${protocol}`,
+    const target = await getSharedCopyTarget(hostId, sharedCopySyncId);
+    const response = await target.api.get(
+      `/rbac/host-access/${target.hostId}/auth/${protocol}`,
     );
     return response.data;
   } catch (error) {
@@ -339,64 +387,21 @@ export async function setHostAuthOverride(
   hostId: number,
   protocol: AuthOverrideProtocol,
   credentialId: number | null,
-  remoteShared = false,
+  sharedCopySyncId?: string | null,
 ): Promise<{
   success: boolean;
   protocol: AuthOverrideProtocol;
   credentialId: number | null;
 }> {
   try {
-    const api = remoteShared ? await getConnectedRemoteApi() : rbacApi;
-    if (!api) throw new Error("Remote server is not connected");
-    const targetHostId = remoteShared ? Math.abs(hostId) : hostId;
-    const response = await api.put(
-      `/rbac/host-access/${targetHostId}/auth/${protocol}`,
+    const target = await getSharedCopyTarget(hostId, sharedCopySyncId);
+    const response = await target.api.put(
+      `/rbac/host-access/${target.hostId}/auth/${protocol}`,
       { credentialId },
     );
     return response.data;
   } catch (error) {
     throw handleApiError(error, "update host authentication override");
-  }
-}
-
-// ============================================================================
-// SNIPPET SHARING
-// ============================================================================
-
-export async function shareSnippet(
-  snippetId: number,
-  shareData: {
-    targetType: "user" | "role";
-    targetUserId?: string;
-    targetRoleId?: number;
-    durationHours?: number;
-  },
-): Promise<{ success: boolean }> {
-  try {
-    const response = await rbacApi.post(
-      `/rbac/snippet/${snippetId}/share`,
-      shareData,
-    );
-    return response.data;
-  } catch (error) {
-    throw handleApiError(error, "share snippet");
-  }
-}
-
-export async function shareSnippetFolder(
-  folder: string,
-  targets: ShareTarget[],
-  durationHours?: number,
-): Promise<{ success: boolean; snippetsShared: number }> {
-  try {
-    const response = await rbacApi.post("/rbac/snippet-folder/share", {
-      folder,
-      targets,
-      durationHours,
-    });
-    return response.data;
-  } catch (error) {
-    throw handleApiError(error, "share snippet folder");
   }
 }
 
@@ -440,50 +445,5 @@ export async function revokeCredentialAccess(
     await rbacApi.delete(`/rbac/credential/${credentialId}/access/${accessId}`);
   } catch (error) {
     throw handleApiError(error, "revoke credential access");
-  }
-}
-
-export async function getSnippetAccess(
-  snippetId: number,
-): Promise<{ accessList: AccessRecord[] }> {
-  try {
-    const response = await rbacApi.get(`/rbac/snippet/${snippetId}/access`);
-    return response.data;
-  } catch (error) {
-    throw handleApiError(error, "fetch snippet access");
-  }
-}
-
-export async function revokeSnippetAccess(
-  snippetId: number,
-  accessId: number,
-): Promise<{ success: boolean }> {
-  try {
-    const response = await rbacApi.delete(
-      `/rbac/snippet/${snippetId}/access/${accessId}`,
-    );
-    return response.data;
-  } catch (error) {
-    throw handleApiError(error, "revoke snippet access");
-  }
-}
-
-export async function getSharedSnippets(): Promise<{
-  sharedSnippets: Array<{
-    id: number;
-    name: string;
-    content: string;
-    description: string | null;
-    folder: string | null;
-    ownerUsername: string;
-    permissionLevel: string;
-    expiresAt: string | null;
-  }>;
-}> {
-  try {
-    const response = await rbacApi.get("/rbac/shared-snippets");
-    return response.data;
-  } catch (error) {
-    handleApiError(error, "fetch shared snippets");
   }
 }

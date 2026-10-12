@@ -27,12 +27,13 @@ const { URL, pathToFileURL } = require("url");
 const { fork, spawn } = require("child_process");
 const pty = require("node-pty");
 const WebSocket = require("ws");
-const remoteSync = require("./remote-sync.cjs");
+const linkedServer = require("./linked-server.cjs");
+const desktopSettings = require("./desktop-settings.cjs");
 const { launchNativeRdp } = require("./native-rdp.cjs");
 const { isCloseActiveTabInput } = require("./keyboard-shortcuts.cjs");
 const { quitApp } = require("./app-quit.cjs");
 const { selectLinuxPasswordStore } = require("./linux-password-store.cjs");
-const { resolveLocalShell } = require("./local-shell.cjs");
+const { resolveLocalShell, repairSpawnHelpers } = require("./local-shell.cjs");
 const { registerLocalFileHandlers } = require("./local-files.cjs");
 
 const localTerminalSessions = new Map();
@@ -54,7 +55,7 @@ function closeLocalTerminalsFor(ownerId) {
 }
 
 // The main process's Node.js networking (the `https`/`http` modules used by
-// httpFetch below, and the global `fetch` used by remote-sync.cjs) only
+// httpFetch below and the global `fetch`) only
 // trusts Node's bundled Mozilla CA list by default, not the OS/system trust
 // store. Chromium (the renderer, i.e. the web app and the login iframe) uses
 // the OS trust store instead, so a certificate that's valid in-browser --
@@ -432,20 +433,6 @@ function isInsecureModeEnabled() {
   );
 }
 
-function getServerConfigPath() {
-  return path.join(app.getPath("userData"), "server-config.json");
-}
-
-function getServerConfigSync() {
-  try {
-    const configPath = getServerConfigPath();
-    if (!fs.existsSync(configPath)) return null;
-    return JSON.parse(fs.readFileSync(configPath, "utf8"));
-  } catch {
-    return null;
-  }
-}
-
 function getOrigin(url) {
   try {
     return new URL(url).origin;
@@ -493,13 +480,11 @@ function isInvalidCertificateAllowedForUrl(url) {
     // fall through
   }
 
-  // The only remaining "connected remote server" a self-signed/invalid
-  // certificate could legitimately apply to is the Remote Sync server
-  // (also used for C2S tunnel relaying, see getC2SRelayUrl).
-  const config = remoteSync.getRemoteSyncConfig();
-  if (!config?.allowInvalidCertificate || !config?.serverUrl) return false;
-
-  return getOrigin(url) === getOrigin(config.serverUrl);
+  // Otherwise only the server this desktop is linked to, when its link
+  // allows a self-signed certificate.
+  const linked = linkedServer.getLinkedServer();
+  if (!linked?.allowInvalidCertificate) return false;
+  return getOrigin(url) === linked.origin;
 }
 
 function getTlsVerificationOptions(url) {
@@ -633,15 +618,70 @@ if (isInsecureModeEnabled()) {
 app.commandLine.appendSwitch("--enable-features=NetworkService");
 
 let mainWindow = null;
-const { createWebEndpointWindows } = require("./web-endpoint-window.cjs");
-const webEndpointWindows = createWebEndpointWindows({
+const { createIsolatedWindows } = require("./isolated-window.cjs");
+const isolatedWindows = createIsolatedWindows({
   BrowserWindow,
   session,
   getMainWindow: () => mainWindow,
 });
-ipcMain.handle("open-isolated-web-endpoint", (event, options) =>
-  webEndpointWindows.open(event, options),
-);
+
+// Requests from the embedded backend over the fork IPC channel (the other
+// direction from the "shutdown" message main already sends it). A plugin's
+// ctx.desktop.openIsolatedWindow is the one caller today.
+const BACKEND_REQUEST_HANDLERS = {
+  "open-isolated-window": (payload) => isolatedWindows.open(payload),
+  // The OS client for a protocol. Only RDP has one wired up.
+  "launch-external-client": (payload) =>
+    payload?.protocol === "rdp"
+      ? launchNativeRdp(payload)
+      : {
+          success: false,
+          error: `No external client for ${payload?.protocol ?? "this protocol"}`,
+        },
+  "sync-proxy-config": (payload) => {
+    linkedServer.setLinkedServer(payload);
+    return { success: true };
+  },
+};
+
+function isDevRunner() {
+  return (
+    process.env.TERMIX_DEV_RUNNER === "true" &&
+    typeof process.send === "function"
+  );
+}
+
+async function handleBackendRequest(msg) {
+  if (!msg || msg.type !== "backend-request") return;
+  const { id, channel, payload } = msg;
+  const handler = BACKEND_REQUEST_HANDLERS[channel];
+  // Under npm run dev:electron the runner owns the backend and relays these messages.
+  const target =
+    backendProcess && !backendProcess.killed
+      ? backendProcess
+      : isDevRunner()
+        ? process
+        : null;
+  const reply = (response) => {
+    if (!target) return;
+    try {
+      target.send({ type: "backend-response", id, ...response });
+    } catch (error) {
+      logToFile("Failed to reply to backend request:", error.message);
+    }
+  };
+  if (!handler) {
+    reply({ ok: false, error: `Unknown backend request channel: ${channel}` });
+    return;
+  }
+  try {
+    const result = await handler(payload);
+    reply({ ok: true, result });
+  } catch (error) {
+    reply({ ok: false, error: error.message || String(error) });
+  }
+}
+
 let backendProcess = null;
 let backendStartFailed = false;
 // Why the embedded backend died, once it has. Null while it is healthy
@@ -1262,12 +1302,7 @@ app.on(
   "certificate-error",
   (event, _webContents, url, error, certificate, callback) => {
     if (
-      webEndpointWindows.handleCertificateError(
-        event,
-        _webContents,
-        url,
-        callback,
-      )
+      isolatedWindows.handleCertificateError(event, _webContents, url, callback)
     )
       return;
     if (isWebEndpointCertificateAllowed(url)) {
@@ -1297,6 +1332,16 @@ app.on(
     callback(false);
   },
 );
+
+// A reverse proxy in front of the linked server may ask for basic auth; the
+// link's saved username and password answer it. Anything else gets the
+// default behaviour.
+app.on("login", (event, _webContents, details, authInfo, callback) => {
+  const credentials = linkedServer.answerLogin(authInfo, details?.url);
+  if (!credentials) return;
+  event.preventDefault();
+  callback(credentials.username, credentials.password || "");
+});
 
 function getElectronBuildTimestamp() {
   try {
@@ -1432,7 +1477,7 @@ function getBackendPaths() {
       backendCwd: backendDir,
     };
   }
-  // fork() does not go through Electron's asar redirector — use the unpacked path.
+  // fork() does not go through Electron's asar redirector, use the unpacked path.
   // On macOS multi-arch builds (mergeASARs: false), electron-builder names the ASAR
   // app-arm64.asar / app-x64.asar instead of app.asar, so match all variants.
   const unpackedRoot = getUnpackedAppRoot(appRoot);
@@ -1460,8 +1505,8 @@ function getBackendPidFilePath() {
 // Manager) rather than through the normal quit flow, will-quit never fires
 // and stopBackendServer() never runs -- the forked backend child is a
 // genuinely separate OS process on Windows/mac/Linux, so it keeps running
-// and holding every port the backend binds (30001, 30003-30008, 30010,
-// 30012...). Every subsequent launch's own backend then fails outright
+// and holding the port the backend binds (30001). Every subsequent
+// launch's own backend then fails outright
 // with EADDRINUSE and the app is stuck until something manually kills the
 // orphan. Reap any such leftover process, identified by PID file, before
 // spawning a new one.
@@ -1591,6 +1636,16 @@ function startBackendServer() {
       logToFile("[backend:stderr]", chunk.trim());
     });
 
+    backendProcess.on("message", (msg) => {
+      if (!resolved && msg?.type === "backend-ready") {
+        resolved = true;
+        clearTimeout(readyTimeout);
+        logToFile("Backend ready signal received via IPC");
+        resolve(true);
+      }
+      void handleBackendRequest(msg);
+    });
+
     backendProcess.on("exit", (code, signal) => {
       logToFile(`Backend process exited with code ${code}, signal ${signal}`);
       if (!resolved && code !== 0) {
@@ -1663,7 +1718,9 @@ function stopBackendServer() {
   });
 }
 
-const gotTheLock = app.requestSingleInstanceLock();
+// App Sandbox denies the singleton socket bind, which reads as a held lock and
+// quits the app on every launch. macOS reactivates bundled apps anyway.
+const gotTheLock = process.mas || app.requestSingleInstanceLock();
 if (!gotTheLock) {
   console.log("Another instance is already running, quitting...");
   app.quit();
@@ -1682,7 +1739,7 @@ function createTray() {
   try {
     const { nativeImage } = require("electron");
 
-    // Native APIs (Tray, nativeImage) can't load files from inside app.asar —
+    // Native APIs (Tray, nativeImage) can't load files from inside app.asar,
     // use the unpacked path so the OS sees a real file.
     const publicRoot = isDev
       ? path.join(appRoot, "public")
@@ -1702,7 +1759,16 @@ function createTray() {
     } else if (process.platform === "win32") {
       trayIcon = path.join(publicRoot, "icon.ico");
     } else {
-      trayIcon = path.join(publicRoot, "icons", "32x32.png");
+      trayIcon = loadLinuxTrayIcon(nativeImage, publicRoot);
+      if (!trayIcon) {
+        logToFile("Tray icon not found, skipping the system tray");
+        return;
+      }
+      if (/gnome/i.test(process.env.XDG_CURRENT_DESKTOP || "")) {
+        logToFile(
+          "GNOME shows tray icons only with the AppIndicator extension installed",
+        );
+      }
     }
 
     tray = new Tray(trayIcon);
@@ -1740,10 +1806,27 @@ function createTray() {
       }
     });
 
-    console.log("System tray created successfully");
+    logToFile("System tray created");
   } catch (err) {
-    console.error("Failed to create system tray:", err);
+    tray = null;
+    logToFile("Failed to create system tray:", err?.message || String(err));
   }
+}
+
+function loadLinuxTrayIcon(nativeImage, publicRoot) {
+  const roots = [
+    publicRoot,
+    path.join(process.resourcesPath || "", "app.asar.unpacked", "public"),
+  ];
+  for (const root of roots) {
+    for (const size of ["32x32", "24x24", "48x48"]) {
+      const image = nativeImage.createFromPath(
+        path.join(root, "icons", `${size}.png`),
+      );
+      if (!image.isEmpty()) return image;
+    }
+  }
+  return null;
 }
 
 function createWindow() {
@@ -1815,6 +1898,14 @@ function createWindow() {
 
       details.requestHeaders["User-Agent"] = customUserAgent;
 
+      // YouTube refuses embeds without a Referer, which file:// never sends.
+      if (
+        details.url.startsWith("https://www.youtube-nocookie.com/embed/") &&
+        !details.requestHeaders.Referer
+      ) {
+        details.requestHeaders.Referer = "https://termix.site/";
+      }
+
       const rememberedJwt = getRememberedElectronAuthCookie("jwt", details.url);
       if (rememberedJwt) {
         setCookieHeaderValue(
@@ -1824,7 +1915,12 @@ function createWindow() {
         );
       }
 
-      callback({ requestHeaders: details.requestHeaders });
+      callback({
+        requestHeaders: linkedServer.applyLinkHeaders(
+          details.url,
+          details.requestHeaders,
+        ),
+      });
     },
   );
 
@@ -1933,10 +2029,24 @@ function createWindow() {
     console.log("Frontend loaded successfully");
   });
 
+  mainWindow.webContents.on("will-prevent-unload", (event) => {
+    // Explicit Quit must not be vetoed by the renderer's connection guard.
+    // In this Electron event, preventDefault allows the unload to proceed.
+    if (isQuitting) event.preventDefault();
+  });
+
   mainWindow.on("close", (event) => {
     if (!isQuitting && tray && !tray.isDestroyed()) {
       event.preventDefault();
-      mainWindow.hide();
+      // Stock GNOME has no tray to bring a hidden window back from.
+      if (
+        process.platform === "linux" &&
+        /gnome/i.test(process.env.XDG_CURRENT_DESKTOP || "")
+      ) {
+        mainWindow.minimize();
+      } else {
+        mainWindow.hide();
+      }
     }
   });
 
@@ -1968,118 +2078,9 @@ ipcMain.handle("get-app-version", () => {
   return app.getVersion();
 });
 
-const GITHUB_API_BASE = "https://api.github.com";
-const REPO_OWNER = "Termix-SSH";
-const REPO_NAME = "Termix";
-
-const githubCache = new Map();
-const CACHE_DURATION = 30 * 60 * 1000;
-
-async function fetchGitHubAPI(endpoint, cacheKey) {
-  const cached = githubCache.get(cacheKey);
-  if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
-    return {
-      data: cached.data,
-      cached: true,
-      cache_age: Date.now() - cached.timestamp,
-    };
-  }
-
-  try {
-    const response = await httpFetch(`${GITHUB_API_BASE}${endpoint}`, {
-      headers: {
-        Accept: "application/vnd.github+json",
-        "User-Agent": "TermixElectronUpdateChecker/1.0",
-        "X-GitHub-Api-Version": "2022-11-28",
-      },
-      timeout: 10000,
-    });
-
-    if (!response.ok) {
-      throw new Error(
-        `GitHub API error: ${response.status} ${response.statusText}`,
-      );
-    }
-
-    const data = await response.json();
-
-    githubCache.set(cacheKey, {
-      data,
-      timestamp: Date.now(),
-    });
-
-    return {
-      data: data,
-      cached: false,
-    };
-  } catch (error) {
-    console.error("Failed to fetch from GitHub API:", error);
-    throw error;
-  }
-}
-
-ipcMain.handle("check-electron-update", async () => {
-  try {
-    const localVersion = app.getVersion();
-
-    const releaseData = await fetchGitHubAPI(
-      `/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest`,
-      "latest_release_electron",
-    );
-
-    const rawTag = releaseData.data.tag_name || releaseData.data.name || "";
-    const remoteVersionMatch = rawTag.match(/(\d+\.\d+(\.\d+)?)/);
-    const remoteVersion = remoteVersionMatch ? remoteVersionMatch[1] : null;
-
-    if (!remoteVersion) {
-      return {
-        success: false,
-        error: "Remote version not found",
-        localVersion,
-      };
-    }
-
-    const versionComparison = compareSemver(localVersion, remoteVersion);
-    const status =
-      versionComparison === null || versionComparison === 0
-        ? "up_to_date"
-        : versionComparison > 0
-          ? "beta"
-          : "requires_update";
-
-    const result = {
-      success: true,
-      status,
-      localVersion: localVersion,
-      remoteVersion: remoteVersion,
-      latest_release: {
-        tag_name: releaseData.data.tag_name,
-        name: releaseData.data.name,
-        published_at: releaseData.data.published_at,
-        html_url: releaseData.data.html_url,
-        body: releaseData.data.body,
-      },
-      cached: releaseData.cached,
-      cache_age: releaseData.cache_age,
-    };
-
-    return result;
-  } catch (error) {
-    return {
-      success: false,
-      error: error.message,
-      localVersion: app.getVersion(),
-    };
-  }
-});
-
 ipcMain.handle("get-platform", () => {
   return process.platform;
 });
-
-ipcMain.handle("open-native-rdp", (_event, options) =>
-  launchNativeRdp(options),
-);
 
 ipcMain.handle("get-embedded-server-status", () => {
   return {
@@ -2093,9 +2094,9 @@ ipcMain.handle("get-embedded-server-status", () => {
   };
 });
 
-// OIDC System Browser Authentication (RFC 8252)
+// External login through the system browser (RFC 8252)
 ipcMain.handle(
-  "oidc-system-browser-auth",
+  "external-browser-login",
   async (_event, authUrl, callbackPort) => {
     const http = require("http");
 
@@ -2108,13 +2109,21 @@ ipcMain.handle(
           const success = url.searchParams.get("success");
           const error = url.searchParams.get("error");
           const token = url.searchParams.get("token");
+          const secondFactor = url.searchParams.get("second_factor") === "1";
 
           res.writeHead(200, { "Content-Type": "text/html" });
           res.end(
-            `<html><body><h2>${success === "true" ? "Authentication successful!" : "Authentication failed."}</h2><p>You can close this tab and return to Termix.</p><script>window.close()</script></body></html>`,
+            `<html><body><h2>${success === "true" || secondFactor ? "Authentication successful!" : "Authentication failed."}</h2><p>You can close this tab and return to Termix.</p><script>window.close()</script></body></html>`,
           );
 
-          if (success === "true") {
+          if (secondFactor) {
+            finish({
+              success: false,
+              secondFactor: true,
+              tempToken: url.searchParams.get("temp_token"),
+              factors: url.searchParams.get("second_factors"),
+            });
+          } else if (success === "true") {
             finish({ success: true, token });
           } else {
             finish({
@@ -2161,7 +2170,7 @@ ipcMain.handle(
       // Timeout after 5 minutes
       timeout = setTimeout(
         () => {
-          fail(new Error("OIDC authentication timed out"));
+          fail(new Error("External login timed out"));
         },
         5 * 60 * 1000,
       );
@@ -2169,109 +2178,20 @@ ipcMain.handle(
   },
 );
 
-ipcMain.handle("get-server-config", () => {
-  try {
-    return getServerConfigSync();
-  } catch (error) {
-    console.error("Error reading server config:", error);
-    return null;
-  }
-});
-
-ipcMain.handle("save-server-config", (event, config) => {
-  try {
-    const userDataPath = app.getPath("userData");
-    const configPath = getServerConfigPath();
-
-    if (!fs.existsSync(userDataPath)) {
-      fs.mkdirSync(userDataPath, { recursive: true });
-    }
-
-    fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
-    return { success: true };
-  } catch (error) {
-    console.error("Error saving server config:", error);
-    return { success: false, error: error.message };
-  }
-});
-
-// --- Remote sync (optional desktop <-> self-hosted server sync) ---
-
-// Surfaces the pre-standalone-rework server-config.json (if a serverUrl was
-// ever set in it) so the renderer can prompt upgraded installs to set up
-// Remote Sync -- their hosts live on that old server and won't appear
-// locally until sync is enabled. A fresh install never had this file, so
-// this is naturally false for anyone who never used the old architecture.
-ipcMain.handle("get-legacy-server-config", () => {
-  const config = getServerConfigSync();
-  return { serverUrl: config?.serverUrl || null };
-});
-
+// Desktop-only settings, such as whether hosts connect from this device or
+// through the linked server by default.
 ipcMain.handle("get-desktop-settings", () => {
-  return remoteSync.getDesktopSettings();
+  return desktopSettings.getDesktopSettings();
 });
 
 ipcMain.handle("save-desktop-settings", (_event, settings) => {
-  return remoteSync.saveDesktopSettings(settings);
+  return desktopSettings.saveDesktopSettings(settings);
 });
 
-ipcMain.handle("get-remote-sync-config", () => {
-  return remoteSync.getRemoteSyncConfig();
-});
-
-ipcMain.handle("save-remote-sync-config", (_event, config) => {
-  return remoteSync.saveRemoteSyncConfig(config);
-});
-
-ipcMain.handle("clear-remote-sync-config", async () => {
-  const result = remoteSync.clearRemoteSyncConfig();
-  remoteSync.clearRemoteSyncJwt();
-  remoteSync.getRemoteSyncEngine()?.updateStatus({
-    connected: false,
-    syncing: false,
-    needsReauth: false,
-    lastError: null,
-  });
-  return result;
-});
-
-ipcMain.handle("save-remote-sync-jwt", async (_event, token) => {
-  const result = remoteSync.saveRemoteSyncJwt(token);
-  if (result.success) {
-    remoteSync.getRemoteSyncEngine()?.updateStatus({
-      connected: true,
-      needsReauth: false,
-      lastError: null,
-    });
-    const status = await remoteSync.getRemoteSyncEngine()?.syncNow();
-    return { ...result, status: status || null };
-  }
-  return result;
-});
-
-ipcMain.handle("get-remote-sync-jwt", () => {
-  return remoteSync.getRemoteSyncJwt();
-});
-
-ipcMain.handle("clear-remote-sync-jwt", () => {
-  return remoteSync.clearRemoteSyncJwt();
-});
-
-ipcMain.handle("get-remote-sync-status", () => {
-  return remoteSync.getRemoteSyncEngine()?.status || null;
-});
-
-ipcMain.handle("get-remote-sync-user-info", () => {
-  return remoteSync.getRemoteSyncUserInfo();
-});
-
-ipcMain.handle("remote-sync-now", async () => {
-  return (await remoteSync.getRemoteSyncEngine()?.syncNow()) || null;
-});
-
-ipcMain.handle("notify-local-login", (_event, token) => {
-  remoteSync.getRemoteSyncEngine()?.setLocalJwt(token);
-  return { success: true };
+// The server an older version of the app was pointed at, offered again when
+// linking so upgraded installs do not have to look it up.
+ipcMain.handle("get-previous-server-url", () => {
+  return { serverUrl: desktopSettings.getPreviousServerUrl() };
 });
 
 function getC2STunnelConfigPath() {
@@ -2440,40 +2360,45 @@ const C2S_WS_HIGH_WATERMARK = 1024 * 1024;
 const C2S_WS_LOW_WATERMARK = 256 * 1024;
 const C2S_STREAM_WRITE_LIMIT = 8 * 1024 * 1024;
 
-// C2S (client-to-server) tunnels relay through a connected, self-hosted
-// Termix server -- the same "remote server" concept Remote Sync connects
-// to, not the always-local embedded backend. There's no separate C2S
-// server-URL setting in the UI; it has always shared whatever remote
-// server the rest of the app was pointed at. Before the standalone-first
-// rework that was server-config.json; now it's remote-sync-config.json,
-// since that's the only remaining notion of "a connected remote server."
-function getC2SRelayUrl() {
-  const config = remoteSync.getRemoteSyncConfig();
-  const serverUrl = config?.serverUrl;
-  if (!serverUrl) {
-    throw new Error(
-      "No remote Termix server connected -- enable Remote Sync first",
-    );
-  }
-
-  const base = serverUrl.replace(/\/$/, "");
-  const relayHttpUrl = `${base}/ssh/tunnel/c2s/stream`;
-  return relayHttpUrl.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
-}
-
+// C2S (client-to-server) tunnels relay through the server this desktop is
+// linked to, not the embedded backend.
 function getC2SRemoteBaseUrl() {
-  const config = remoteSync.getRemoteSyncConfig();
-  const serverUrl = config?.serverUrl;
+  const serverUrl = linkedServer.getLinkedServer()?.serverUrl;
   if (!serverUrl) {
     throw new Error(
-      "No remote Termix server connected -- enable Remote Sync first",
+      "This device is not linked to a Termix server. Link it in Sync first.",
     );
   }
   return serverUrl.replace(/\/$/, "");
 }
 
+// The socket path on the linked server that relays C2S streams. The plugin
+// that owns the relay tells us where it is, so nothing here names it.
+let c2sRelayPath = null;
+const C2S_RELAY_PATH_PATTERN =
+  /^\/plugin-ws\/[a-z0-9][a-z0-9-]*\/[A-Za-z0-9/_-]+$/;
+
+ipcMain.handle("set-c2s-relay-path", (_event, relayPath) => {
+  if (
+    typeof relayPath !== "string" ||
+    !C2S_RELAY_PATH_PATTERN.test(relayPath)
+  ) {
+    return { success: false, error: "Invalid relay path" };
+  }
+  c2sRelayPath = relayPath;
+  return { success: true };
+});
+
+function getC2SRelayUrl() {
+  if (!c2sRelayPath) {
+    throw new Error("Client tunnels are not available yet. Try again shortly.");
+  }
+  const relayHttpUrl = `${getC2SRemoteBaseUrl()}${c2sRelayPath}`;
+  return relayHttpUrl.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
+}
+
 const C2S_REMOTE_SESSION_EXPIRED_ERROR =
-  "Remote Termix session expired. Reconnect Remote Sync and try again.";
+  "This device was signed out of its server. Sign in again from Sync and try again.";
 
 function normalizeC2SAuthToken(authToken) {
   return typeof authToken === "string" ? authToken.trim() : "";
@@ -2488,7 +2413,9 @@ function isC2SAuthError(message) {
     value === "missing authentication token" ||
     value === "invalid token" ||
     value === "session expired" ||
-    value === "session not found"
+    value === "session not found" ||
+    // The plugin relay refuses an unauthenticated upgrade before any message.
+    value === "unexpected server response: 401"
   );
 }
 
@@ -2509,17 +2436,13 @@ function createC2SFailure(message, fallback) {
 }
 
 async function fetchC2SRemoteJson(pathname) {
-  const remoteSyncJwt = remoteSync.getRemoteSyncJwt();
-  if (!remoteSyncJwt || remoteSync.isJwtExpiredOrExpiringSoon(remoteSyncJwt)) {
+  if (!linkedServer.getLinkedServer()?.token) {
     throw new Error(C2S_REMOTE_SESSION_EXPIRED_ERROR);
   }
 
   const url = `${getC2SRemoteBaseUrl()}${pathname}`;
-  const response = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${remoteSyncJwt}`,
-      "X-Electron-App": "true",
-    },
+  const response = await httpFetch(url, {
+    headers: linkedServer.linkedRequestHeaders(),
   });
   if (response.status === 401 || response.status === 403) {
     throw new Error(C2S_REMOTE_SESSION_EXPIRED_ERROR);
@@ -2538,14 +2461,18 @@ async function resolveC2SRemoteSourceHost(tunnel) {
       : "";
   if (!sourceHostSyncId) return normalized;
 
-  const data = await fetchC2SRemoteJson("/sync/hosts");
-  const remoteHost = (Array.isArray(data?.rows) ? data.rows : []).find(
-    (row) => row?.syncId === sourceHostSyncId,
-  );
+  let remoteHost = null;
+  try {
+    remoteHost = await fetchC2SRemoteJson(
+      `/sync/v2/hosts/${encodeURIComponent(sourceHostSyncId)}`,
+    );
+  } catch (error) {
+    if (error.message === C2S_REMOTE_SESSION_EXPIRED_ERROR) throw error;
+  }
   const remoteHostId = Number(remoteHost?.id);
   if (!Number.isInteger(remoteHostId) || remoteHostId < 1) {
     throw new Error(
-      "Intermediate Host is not available on the remote Termix server yet. Run Remote Sync for hosts, then try again.",
+      "The intermediate host is not on the server yet. Sync, then try again.",
     );
   }
 
@@ -2559,17 +2486,10 @@ async function resolveC2SRemoteSourceHost(tunnel) {
 }
 
 async function getC2SRelayHeaders(relayUrl) {
+  if (linkedServer.getLinkedServer()?.token) {
+    return linkedServer.linkedRequestHeaders();
+  }
   const headers = { "X-Electron-App": "true" };
-
-  const remoteSyncJwt = remoteSync.getRemoteSyncJwt();
-  if (remoteSyncJwt && !remoteSync.isJwtExpiredOrExpiringSoon(remoteSyncJwt)) {
-    headers.Authorization = `Bearer ${remoteSyncJwt}`;
-    return headers;
-  }
-
-  if (remoteSyncJwt) {
-    throw new Error(C2S_REMOTE_SESSION_EXPIRED_ERROR);
-  }
 
   if (!mainWindow?.webContents?.session) {
     throw new Error(C2S_REMOTE_SESSION_EXPIRED_ERROR);
@@ -2590,6 +2510,11 @@ async function getC2SRelayHeaders(relayUrl) {
   headers.Cookie = `jwt=${encodeURIComponent(jwt)}`;
   return headers;
 }
+
+const attachC2SAuth = require("./c2s-auth.cjs").createC2SAuthBridge(
+  ipcMain,
+  () => mainWindow,
+);
 
 function getC2STunnelName(tunnel, index = 0) {
   if (tunnel.name) return tunnel.name;
@@ -2698,15 +2623,11 @@ async function openC2SRelay(
     targetHost,
     targetPort,
   });
-  setC2STunnelStatus(tunnelName, {
-    connected: false,
-    status: "CONNECTING",
-    reason: `Opening relay to ${targetHost}:${targetPort}`,
-  });
   const ws = new WebSocket(
     relayUrl,
     getWebSocketOptions(relayUrl, { headers }),
   );
+  attachC2SAuth(ws, tunnel.name || getC2STunnelName(tunnel));
   const pendingChunks = [];
   let ready = false;
   let closed = false;
@@ -2736,13 +2657,16 @@ async function openC2SRelay(
 
   socket.on("data", sendChunk);
   socket.on("close", cleanup);
+  // One connection failing must not stop the tunnel: the listener refuses
+  // new connections while the tunnel is not connected, and a browser opens
+  // many at once.
   socket.on("error", (error) => {
-    setC2STunnelError(tunnelName, error.message || "Local socket error");
+    logToFile(`[c2s] ${tunnelName} local socket error:`, error.message);
     cleanup();
   });
   ws.on("close", cleanup);
   ws.on("error", (error) => {
-    setC2STunnelError(tunnelName, error.message || "Relay connection failed");
+    logToFile(`[c2s] ${tunnelName} relay error:`, error.message);
     cleanup();
   });
 
@@ -2769,10 +2693,6 @@ async function openC2SRelay(
       if (message.type === "ready") {
         ready = true;
         logToFile(`[c2s] relay ready for ${tunnelName}`);
-        setC2STunnelStatus(tunnelName, {
-          connected: true,
-          status: "CONNECTED",
-        });
         if (initialData?.length) {
           ws.send(initialData);
         }
@@ -2785,33 +2705,45 @@ async function openC2SRelay(
           "Relay rejected the client tunnel",
         );
         logToFile("[c2s] relay error:", relayError);
-        setC2STunnelError(tunnelName, relayError);
+        if (relayError === C2S_REMOTE_SESSION_EXPIRED_ERROR) {
+          setC2STunnelError(tunnelName, relayError);
+        }
         cleanup();
       }
     } catch (error) {
       logToFile("[c2s] invalid relay message:", error.message);
-      setC2STunnelError(tunnelName, error.message || "Invalid relay response");
       cleanup();
     }
   });
 }
 
-async function testC2SRelay(tunnel, targetHost, targetPort, authToken) {
+async function testC2SRelay(
+  tunnel,
+  targetHost,
+  targetPort,
+  authToken,
+  runtime,
+) {
   const tunnelConfig = normalizeC2STunnelAddresses(tunnel);
   const relayUrl = getC2SRelayUrl();
   const headers = await getC2SRelayHeaders(relayUrl, authToken);
+  if (runtime && c2sTunnelRuntimes.get(tunnel.name) !== runtime) {
+    return { success: false, error: "Tunnel stopped" };
+  }
   const ws = new WebSocket(
     relayUrl,
     getWebSocketOptions(relayUrl, { headers }),
   );
+  attachC2SAuth(ws, tunnel.name || getC2STunnelName(tunnel));
 
+  if (runtime) runtime.authSocket = ws;
   return new Promise((resolve) => {
     let settled = false;
     const settle = (result) => {
       if (settled) return;
       settled = true;
       try {
-        ws.close();
+        if (!runtime || !result.success) ws.close();
       } catch {
         // expected during shutdown
       }
@@ -2820,12 +2752,13 @@ async function testC2SRelay(tunnel, targetHost, targetPort, authToken) {
 
     const timer = setTimeout(() => {
       settle({ success: false, error: "Tunnel test timed out" });
-    }, 15000);
+    }, 180_000);
 
     ws.on("open", () => {
       ws.send(
         JSON.stringify({
           type: "test",
+          keepAlive: !!runtime,
           tunnelConfig,
           targetHost,
           targetPort,
@@ -2854,6 +2787,9 @@ async function testC2SRelay(tunnel, targetHost, targetPort, authToken) {
       settle(createC2SFailure(error.message, "Tunnel test failed"));
     });
     ws.on("close", () => {
+      if (runtime && c2sTunnelRuntimes.get(tunnel.name) === runtime) {
+        setC2STunnelError(tunnel.name, "Endpoint SSH connection closed");
+      }
       clearTimeout(timer);
       settle({ success: false, error: "Tunnel test connection closed" });
     });
@@ -3001,7 +2937,9 @@ function handleC2SLocalConnection(tunnel, socket, authToken) {
       "Local relay failed",
     );
     logToFile("[c2s] local relay failed:", message);
-    setC2STunnelError(tunnelName, message);
+    if (message === C2S_REMOTE_SESSION_EXPIRED_ERROR) {
+      setC2STunnelError(tunnelName, message);
+    }
     socket.destroy();
   });
 }
@@ -3106,6 +3044,7 @@ async function startC2SRemoteTunnel(tunnel, index = 0, authToken) {
     relayUrl,
     getWebSocketOptions(relayUrl, { headers }),
   );
+  attachC2SAuth(ws, tunnel.name || getC2STunnelName(tunnel));
   const sockets = new Map();
   let closed = false;
 
@@ -3294,7 +3233,10 @@ async function startC2STunnel(tunnel, index = 0, authToken) {
   const resolvedTunnel = await resolveC2SRemoteSourceHost(tunnel);
   const mode = resolvedTunnel.mode || resolvedTunnel.tunnelType || "local";
   const tunnelName = getC2STunnelName(resolvedTunnel, index);
-  const tunnelConfig = normalizeC2STunnelAddresses(resolvedTunnel);
+  const tunnelConfig = {
+    ...normalizeC2STunnelAddresses(resolvedTunnel),
+    sessionId: crypto.randomUUID(),
+  };
   const bindHost = getC2SLocalAddress(tunnelConfig);
   const sourcePort = Number(resolvedTunnel.sourcePort);
   logToFile(`[c2s] starting tunnel ${tunnelName}`, {
@@ -3345,6 +3287,10 @@ async function startC2STunnel(tunnel, index = 0, authToken) {
 
   const sockets = new Set();
   const server = net.createServer((socket) => {
+    if (!c2sTunnelRuntimes.get(tunnelName)?.status.connected) {
+      socket.destroy();
+      return;
+    }
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
     if (mode === "dynamic") {
@@ -3387,33 +3333,38 @@ async function startC2STunnel(tunnel, index = 0, authToken) {
         reason: "Verifying endpoint SSH connection",
       });
 
-      const verifyTunnel =
-        mode === "dynamic"
-          ? testC2SRelay(
-              { ...tunnel, name: `${tunnelName}::verify`, mode },
-              undefined,
-              undefined,
-            )
-          : testC2SRelay(
-              { ...tunnel, name: `${tunnelName}::verify`, mode },
-              tunnel.targetHost || "127.0.0.1",
-              Number(tunnel.endpointPort),
-            );
+      const runtime = c2sTunnelRuntimes.get(tunnelName);
+      const verifyTunnel = testC2SRelay(
+        { ...tunnelConfig, name: tunnelName, mode },
+        mode === "dynamic" ? undefined : getC2SRemoteAddress(tunnelConfig),
+        mode === "dynamic" ? undefined : Number(tunnelConfig.endpointPort),
+        authToken,
+        runtime,
+      );
 
-      verifyTunnel.then((result) => {
-        if (!c2sTunnelRuntimes.has(tunnelName)) return;
-        if (result.success) {
-          setC2STunnelStatus(tunnelName, {
-            connected: true,
-            status: "CONNECTED",
-          });
-        } else {
-          setC2STunnelError(
-            tunnelName,
-            result.error || "Endpoint SSH connection failed",
-          );
-        }
-      });
+      verifyTunnel
+        .then((result) => {
+          if (c2sTunnelRuntimes.get(tunnelName) !== runtime) return;
+          if (result.success) {
+            setC2STunnelStatus(tunnelName, {
+              connected: true,
+              status: "CONNECTED",
+            });
+          } else {
+            setC2STunnelError(
+              tunnelName,
+              result.error || "Endpoint SSH connection failed",
+            );
+          }
+        })
+        .catch((error) => {
+          if (c2sTunnelRuntimes.get(tunnelName) === runtime) {
+            setC2STunnelError(
+              tunnelName,
+              error.message || "Endpoint SSH connection failed",
+            );
+          }
+        });
 
       resolve({ success: true, tunnelName });
     });
@@ -3430,6 +3381,7 @@ async function stopC2STunnel(tunnelName) {
     connected: false,
     status: "DISCONNECTING",
   });
+  runtime.authSocket?.close();
 
   return new Promise((resolve) => {
     if (typeof runtime.close === "function") {
@@ -3454,6 +3406,7 @@ async function stopC2STunnel(tunnelName) {
 function stopAllC2STunnels() {
   for (const [tunnelName, runtime] of c2sTunnelRuntimes.entries()) {
     try {
+      runtime.authSocket?.close();
       if (typeof runtime.close === "function") {
         runtime.close();
       } else {
@@ -3924,17 +3877,32 @@ ipcMain.handle("local-terminal-start", (event, dimensions = {}) => {
   const rows = Math.min(300, Math.max(1, Number(dimensions.rows) || 24));
   const sessionId = crypto.randomUUID();
   const shellConfig = resolveLocalShell(process.platform, dimensions.shell);
-  const child = pty.spawn(shellConfig.file, shellConfig.args, {
-    name: "xterm-256color",
-    cols,
-    rows,
-    cwd: os.homedir(),
-    env: {
-      ...process.env,
-      TERM: "xterm-256color",
-      COLORTERM: "truecolor",
-    },
-  });
+  const spawnShell = () =>
+    pty.spawn(shellConfig.file, shellConfig.args, {
+      name: "xterm-256color",
+      cols,
+      rows,
+      cwd: os.homedir(),
+      env: {
+        ...process.env,
+        TERM: "xterm-256color",
+        COLORTERM: "truecolor",
+      },
+    });
+  let child;
+  try {
+    child = spawnShell();
+  } catch (error) {
+    const ptyDir = path.dirname(require.resolve("node-pty/package.json"));
+    if (
+      !String(error?.message).includes("posix_spawnp") ||
+      repairSpawnHelpers(ptyDir) === 0
+    ) {
+      throw error;
+    }
+    logToFile("[local-terminal] restored the spawn-helper execute bit");
+    child = spawnShell();
+  }
   const ownerId = event.sender.id;
   const session = { ownerId, process: child, ready: false, buffered: "" };
   localTerminalSessions.set(sessionId, session);
@@ -4378,88 +4346,6 @@ ipcMain.handle("close-external-editor", (_event, editId) => {
   }
 });
 
-async function testServerConnection(
-  _event,
-  serverUrl,
-  allowInvalidCertificate = false,
-) {
-  try {
-    const normalizedServerUrl = serverUrl.replace(/\/$/, "");
-    const healthUrl = `${normalizedServerUrl}/health`;
-
-    // This is a best-effort reachability probe, not a hard gate: a reverse
-    // proxy doing SSO in front of the real server (Pangolin, Authelia,
-    // Cloudflare Access, etc.) intercepts this unauthenticated request
-    // before it ever reaches Termix's own /health route, and returns its
-    // own login page (HTML, or a redirect) instead of {"status":"ok"}.
-    // That's a legitimate, working setup -- the login iframe shown right
-    // after this check is what actually proves the server is real, by
-    // completing an authenticated round-trip. So any response at all here
-    // (any status code, any body) means "something is there, let the user
-    // proceed"; only a network-level failure (nothing answered at all)
-    // blocks continuing.
-    try {
-      const response = await httpFetch(healthUrl, {
-        method: "GET",
-        timeout: 10000,
-        allowInvalidCertificate,
-      });
-
-      const data = await response.text();
-      const looksLikeHtml =
-        data.includes("<html") ||
-        data.includes("<!DOCTYPE") ||
-        data.includes("<head>") ||
-        data.includes("<body>");
-
-      if (response.ok && !looksLikeHtml) {
-        try {
-          const healthData = JSON.parse(data);
-          if (
-            healthData &&
-            (healthData.status === "ok" ||
-              healthData.status === "healthy" ||
-              healthData.healthy === true ||
-              healthData.database === "connected")
-          ) {
-            return {
-              success: true,
-              status: response.status,
-              testedUrl: healthUrl,
-            };
-          }
-        } catch (parseError) {
-          console.log("Health endpoint did not return valid JSON");
-        }
-      }
-
-      // Reachable, but not a recognized Termix health response -- likely a
-      // proxy/SSO login page in front of the real server. Let the user
-      // proceed; the login step next will fail clearly if this really
-      // isn't a Termix server.
-      return {
-        success: true,
-        status: response.status,
-        testedUrl: healthUrl,
-        warning: looksLikeHtml
-          ? "Could not confirm this is a Termix server (the response looked like an HTML page, which can happen behind a login-protected reverse proxy). You can continue, and the next step will fail clearly if this isn't actually a Termix server."
-          : "Server responded, but not with the expected health check format. Continuing anyway.",
-      };
-    } catch (urlError) {
-      console.error("Health check failed:", urlError);
-      return {
-        success: false,
-        error:
-          "Server is not responding. Please ensure the server is running and accessible.",
-      };
-    }
-  } catch (error) {
-    return { success: false, error: error.message };
-  }
-}
-
-ipcMain.handle("test-server-connection", testServerConnection);
-
 // Local disk browsing + streamed local<->remote transfers for the file
 // manager's dual-pane mode (see electron/local-files.cjs).
 registerLocalFileHandlers({ ipcMain, shell });
@@ -4546,13 +4432,16 @@ app.whenReady().then(async () => {
     logToFile("startBackendServer result:", result);
   } else {
     logToFile(
-      "Skipping embedded backend (isDev=true) - expecting separate dev:backend process",
+      "Skipping embedded backend (isDev=true) - expecting the dev runner's backend",
     );
+    if (isDevRunner()) {
+      process.on("message", (msg) => void handleBackendRequest(msg));
+    }
   }
 
   createTray();
   createWindow();
-  remoteSync.initRemoteSync(() => mainWindow);
+  desktopSettings.removeOldSyncFiles();
   logToFile("=== Startup complete ===");
 });
 

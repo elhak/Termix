@@ -1,98 +1,68 @@
 import { and, eq } from "drizzle-orm";
 import { pluginInstallCounts } from "../db/schema.js";
 import type { DatabaseContext } from "./database-context.js";
-import { rowsAffected } from "./mutation-result.js";
-import { insertReturning, updateReturning } from "./returning.js";
 
 export type PluginInstallCountRecord = typeof pluginInstallCounts.$inferSelect;
 
-export interface PluginInstallCountUpsertInput {
+export interface PluginInstallCountInput {
   pluginId: string;
-  registryId: string;
   count: number;
-  source?: string;
+  source: string;
 }
 
+/** Popularity numbers for the store, one row per plugin and registry. */
 export class PluginInstallCountRepository {
   constructor(
     private readonly context: DatabaseContext,
     private readonly onWrite?: () => void | Promise<void>,
   ) {}
 
-  async listByPlugin(pluginId: string): Promise<PluginInstallCountRecord[]> {
+  async listByRegistry(
+    registryId: string,
+  ): Promise<PluginInstallCountRecord[]> {
     return this.context.drizzle
       .select()
       .from(pluginInstallCounts)
-      .where(eq(pluginInstallCounts.pluginId, pluginId));
+      .where(eq(pluginInstallCounts.registryId, registryId));
   }
 
-  async findByPluginAndRegistry(
-    pluginId: string,
+  /** Writes only the rows that changed, so an unchanged sync costs no save. */
+  async upsertMany(
     registryId: string,
-  ): Promise<PluginInstallCountRecord | null> {
-    const rows = await this.context.drizzle
-      .select()
-      .from(pluginInstallCounts)
-      .where(
-        and(
-          eq(pluginInstallCounts.pluginId, pluginId),
-          eq(pluginInstallCounts.registryId, registryId),
-        ),
-      )
-      .limit(1);
-
-    return rows[0] ?? null;
-  }
-
-  async upsert(
-    input: PluginInstallCountUpsertInput,
+    entries: PluginInstallCountInput[],
     now = new Date().toISOString(),
-  ): Promise<PluginInstallCountRecord> {
-    const existing = await this.findByPluginAndRegistry(
-      input.pluginId,
-      input.registryId,
+  ): Promise<number> {
+    const existing = new Map(
+      (await this.listByRegistry(registryId)).map((row) => [row.pluginId, row]),
     );
-
-    if (existing) {
-      const [updated] = await updateReturning(
-        this.context,
-        pluginInstallCounts,
-        {
-          count: input.count,
-          source: input.source ?? existing.source,
+    let written = 0;
+    for (const entry of entries) {
+      const row = existing.get(entry.pluginId);
+      if (row && row.count === entry.count && row.source === entry.source) {
+        continue;
+      }
+      if (row) {
+        await this.context.drizzle
+          .update(pluginInstallCounts)
+          .set({ count: entry.count, source: entry.source, updatedAt: now })
+          .where(
+            and(
+              eq(pluginInstallCounts.pluginId, entry.pluginId),
+              eq(pluginInstallCounts.registryId, registryId),
+            ),
+          );
+      } else {
+        await this.context.drizzle.insert(pluginInstallCounts).values({
+          pluginId: entry.pluginId,
+          registryId,
+          count: entry.count,
+          source: entry.source,
           updatedAt: now,
-        },
-        eq(pluginInstallCounts.id, existing.id),
-      );
-
-      await this.afterWrite();
-      return updated;
+        });
+      }
+      written += 1;
     }
-
-    const [created] = await insertReturning(this.context, pluginInstallCounts, {
-      pluginId: input.pluginId,
-      registryId: input.registryId,
-      count: input.count,
-      source: input.source ?? "aggregate-telemetry",
-      updatedAt: now,
-    });
-
-    await this.afterWrite();
-    return created;
-  }
-
-  async deleteByPlugin(pluginId: string): Promise<number> {
-    const result = await this.context.drizzle
-      .delete(pluginInstallCounts)
-      .where(eq(pluginInstallCounts.pluginId, pluginId));
-
-    if (rowsAffected(result) > 0) {
-      await this.afterWrite();
-    }
-    return rowsAffected(result);
-  }
-
-  private async afterWrite(): Promise<void> {
-    await this.onWrite?.();
+    if (written > 0) await this.onWrite?.();
+    return written;
   }
 }

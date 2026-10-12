@@ -1,10 +1,10 @@
 cask "termix" do
-  version "2.8.0"
-  sha256 "e4030d648055650c682a451038814d4463230d2673457c2e337105458f84ce3d"
+  version "26.10.0"
+  sha256 "66a76a62fbea3306bdf35b0951e9b1200fd1a084a95b4fee9d40edd6e326e11a"
 
-  url "https://github.com/Termix-SSH/Termix/releases/download/release-#{version}-tag/termix_macos_universal_dmg.dmg"
+  url "https://github.com/Termix-SSH/Termix/releases/download/v#{version}/termix_macos_universal_dmg.dmg"
   name "Termix"
-  desc "Web-based server management platform with SSH terminal, tunneling, and file editing"
+  desc "Self-hosted, plugin-based server management"
   homepage "https://github.com/Termix-SSH/Termix"
 
   livecheck do
