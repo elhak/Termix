@@ -26,12 +26,38 @@ function invokeAllowed(channel, ...args) {
   return ipcRenderer.invoke(channel, ...args);
 }
 
+// The embedded backend's port, picked by the main process at startup.
+const backendPortArg = process.argv.find((arg) =>
+  arg.startsWith("--termix-backend-port="),
+);
+const backendPort = backendPortArg
+  ? Number(backendPortArg.split("=")[1])
+  : undefined;
+
 contextBridge.exposeInMainWorld("electronAPI", {
+  backendPort,
   getAppVersion: () => ipcRenderer.invoke("get-app-version"),
   getPlatform: () => ipcRenderer.invoke("get-platform"),
   getEmbeddedServerStatus: () =>
     ipcRenderer.invoke("get-embedded-server-status"),
   openNativeRdp: (options) => ipcRenderer.invoke("open-native-rdp", options),
+
+  // App Store builds are updated by the store.
+  updates: process.mas
+    ? undefined
+    : {
+        getState: () => ipcRenderer.invoke("desktop-update-get-state"),
+        check: () => ipcRenderer.invoke("desktop-update-check"),
+        download: () => ipcRenderer.invoke("desktop-update-download"),
+        install: () => ipcRenderer.invoke("desktop-update-install"),
+        setMode: (mode) => ipcRenderer.invoke("desktop-update-set-mode", mode),
+        onState: (callback) => {
+          const listener = (_event, state) => callback(state);
+          ipcRenderer.on("desktop-update-state", listener);
+          return () =>
+            ipcRenderer.removeListener("desktop-update-state", listener);
+        },
+      },
 
   removeAllListeners: (channel) => ipcRenderer.removeAllListeners(channel),
   isElectron: true,
@@ -88,16 +114,6 @@ contextBridge.exposeInMainWorld("electronAPI", {
   },
 
   clearSessionCookies: () => ipcRenderer.invoke("clear-session-cookies"),
-  getSessionCookie: (name, targetUrl) =>
-    ipcRenderer.invoke("get-session-cookie", name, targetUrl),
-  waitForSessionCookie: (name, targetUrl, previousValue, timeoutMs) =>
-    ipcRenderer.invoke(
-      "wait-session-cookie",
-      name,
-      targetUrl,
-      previousValue,
-      timeoutMs,
-    ),
 
   oidcSystemBrowserAuth: (authUrl, callbackPort) =>
     ipcRenderer.invoke("oidc-system-browser-auth", authUrl, callbackPort),

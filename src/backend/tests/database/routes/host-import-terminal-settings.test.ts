@@ -37,11 +37,14 @@ vi.mock("../../../database/repositories/factory.js", () => ({
 }));
 import { registerHostBulkRoutes } from "../../../database/routes/host-bulk-routes.js";
 import { buildExportPayload } from "../../../../ui/sidebar/host-export-payload";
+import { pluginEvents, TOPICS } from "../../../plugins/events.js";
 
 let handler: RequestHandler;
+let sshConfigHandler: RequestHandler;
 const router = {
   post: (path: string, ...handlers: RequestHandler[]) => {
     if (path === "/bulk-import") handler = handlers.at(-1)!;
+    if (path === "/ssh-config-import") sshConfigHandler = handlers.at(-1)!;
   },
   put: () => {},
   patch: () => {},
@@ -66,12 +69,13 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.create.mockResolvedValue({ id: 71 });
   mocks.update.mockResolvedValue({ id: 19 });
-  mocks.list.mockResolvedValue([{ ...host, id: 19 }]);
+  mocks.list.mockResolvedValue([]);
 });
 
 it.each([false, true])(
   "carries plugin host settings through export selection and import (overwrite=%s)",
   async (overwrite) => {
+    if (overwrite) mocks.list.mockResolvedValue([{ ...host, id: 19 }]);
     const payload = buildExportPayload(
       { hosts: [host] },
       null,
@@ -168,6 +172,60 @@ it.each([20, "20"])(
   },
 );
 
+it("skips hosts that already exist when not overwriting", async () => {
+  mocks.list.mockResolvedValue([{ ...host, id: 19 }]);
+  const res = await importHosts([host]);
+  expect(res.json).toHaveBeenCalledWith(
+    expect.objectContaining({ success: 0, updated: 0, skipped: 1, failed: 0 }),
+  );
+  expect(mocks.create).not.toHaveBeenCalled();
+  expect(mocks.update).not.toHaveBeenCalled();
+  expect(mocks.applyPluginSettings).not.toHaveBeenCalled();
+});
+
+it("maps a skipped jump host reference to its existing destination ID", async () => {
+  mocks.list.mockResolvedValue([{ ...host, ip: "192.0.2.2", id: 801 }]);
+  const res = await importHosts([
+    { ...host, exportId: 10, jumpHosts: [{ hostId: 20 }] },
+    { ...host, ip: "192.0.2.2", exportId: 20 },
+  ]);
+  expect(res.json).toHaveBeenCalledWith(
+    expect.objectContaining({ success: 1, skipped: 1, failed: 0 }),
+  );
+  expect(mocks.create).toHaveBeenCalledTimes(1);
+  expect(mocks.update).not.toHaveBeenCalled();
+  expect(JSON.parse(mocks.create.mock.calls[0][1].jumpHosts)).toEqual([
+    { hostId: 801 },
+  ]);
+});
+
+it.each([
+  [false, { success: 0, updated: 0, skipped: 1 }],
+  [true, { success: 0, updated: 1, skipped: 0 }],
+])(
+  "SSH config import with an existing host (overwrite=%s)",
+  async (overwrite, counts) => {
+    mocks.list.mockResolvedValue([{ ...host, id: 19 }]);
+    const res = { json: vi.fn(), status: vi.fn().mockReturnThis() };
+    await sshConfigHandler(
+      {
+        userId: "user-1",
+        body: {
+          content: "Host web\n  HostName 192.0.2.1\n  User alice\n  Port 22\n",
+          overwrite,
+        },
+      } as unknown as Request,
+      res as unknown as Response,
+      vi.fn(),
+    );
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ ...counts, failed: 0 }),
+    );
+    expect(mocks.create).not.toHaveBeenCalled();
+    expect(mocks.update).toHaveBeenCalledTimes(overwrite ? 1 : 0);
+  },
+);
+
 it.each([
   [{ ...host, jumpHosts: [{ hostId: 20 }] }],
   [{ ...host, jumpHosts: [{ hostId: "20" }] }],
@@ -201,4 +259,54 @@ it("does not save dependent hosts when importing their jump host fails", async (
     expect.objectContaining({ failed: 2, success: 0 }),
   );
   expect(mocks.create).toHaveBeenCalledTimes(1);
+});
+
+function collectCreated() {
+  const seen: unknown[] = [];
+  const off = pluginEvents.on(TOPICS.hostCreated, (payload) => {
+    seen.push(payload);
+  });
+  return { seen, off };
+}
+
+it("publishes host.created once for each host a JSON import creates", async () => {
+  mocks.list.mockResolvedValue([{ ...host, id: 19 }]);
+  mocks.create.mockResolvedValueOnce({ id: 501 });
+  const { seen, off } = collectCreated();
+  try {
+    await importHosts([host, { ...host, ip: "192.0.2.2" }], true);
+  } finally {
+    off();
+  }
+  // The overwritten host already existed, so only the new one is announced.
+  expect(seen).toEqual([{ hostId: 501, userId: "user-1" }]);
+});
+
+it("publishes host.created once for each host an SSH config import creates", async () => {
+  mocks.create
+    .mockResolvedValueOnce({ id: 601 })
+    .mockResolvedValueOnce({ id: 602 });
+  const { seen, off } = collectCreated();
+  try {
+    await sshConfigHandler(
+      {
+        userId: "user-1",
+        body: {
+          content:
+            "Host a\n  HostName 10.0.0.1\n  User root\nHost b\n  HostName 10.0.0.2\n  User root\n",
+        },
+      } as unknown as Request,
+      {
+        json: vi.fn(),
+        status: vi.fn().mockReturnThis(),
+      } as unknown as Response,
+      vi.fn(),
+    );
+  } finally {
+    off();
+  }
+  expect(seen).toEqual([
+    { hostId: 601, userId: "user-1" },
+    { hostId: 602, userId: "user-1" },
+  ]);
 });

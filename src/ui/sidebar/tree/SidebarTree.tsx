@@ -11,6 +11,7 @@ import {
 import { updatePluginHostSettings } from "@/api/plugins-api";
 import { resetHostToDefaults } from "@/api/host-defaults-api";
 import { PluginIcon } from "@/lib/plugin-icon";
+import { pluginName } from "@/lib/plugin-i18n";
 import { usePluginHostSections } from "@/settings/HostPluginSections";
 import { useTranslation } from "react-i18next";
 import { useVirtualizer } from "@tanstack/react-virtual";
@@ -79,7 +80,7 @@ import { useSidebarDragState } from "./hooks/useSidebarDragState";
 
 export function SidebarTree({
   children,
-  onOpenTab,
+  onOpenTab: openTab,
   onEditHost,
   onShareHost,
   query: externalQuery = "",
@@ -125,6 +126,16 @@ export function SidebarTree({
   rowFields?: HostRowFields;
 }) {
   const { t } = useTranslation();
+  const rootRef = useRef<HTMLDivElement>(null);
+  // Focus left on the clicked row sends the next keys to the host speed
+  // search instead of the session that just opened.
+  const onOpenTab: typeof openTab = (...args) => {
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && rootRef.current?.contains(active)) {
+      active.blur();
+    }
+    openTab(...args);
+  };
   const hostSettingPlugins = usePluginHostSections();
   const hostSwitchPlugins = hostSettingPlugins.filter(
     (plugin) => !!plugin.contributes?.settings?.host?.enableKey,
@@ -939,6 +950,7 @@ export function SidebarTree({
 
   return (
     <div
+      ref={rootRef}
       className="relative flex flex-col flex-1 min-h-0"
       onKeyDown={(event) => {
         if (selectionMode || arrangeMode) return;
@@ -1273,7 +1285,7 @@ export function SidebarTree({
                         value
                           ? "hosts.enablePluginFeature"
                           : "hosts.disablePluginFeature",
-                        { name: plugin.name },
+                        { name: pluginName(t, plugin) },
                       )}
                     </DropdownMenuItem>
                   )),
@@ -1296,7 +1308,7 @@ export function SidebarTree({
                   { id: "core", label: t("hostDefaults.resetCore") },
                   ...hostSettingPlugins.map((plugin) => ({
                     id: plugin.id,
-                    label: plugin.name,
+                    label: pluginName(t, plugin),
                   })),
                 ].map((option) => (
                   <DropdownMenuItem
@@ -1413,7 +1425,6 @@ export function SidebarTree({
                 setConfirmDialog({
                   message: t("hosts.deleteHostsConfirm", {
                     count: selectedHostIds.size,
-                    plural: selectedHostIds.size !== 1 ? "s" : "",
                   }),
                   onConfirm: async () => {
                     const ids = Array.from(selectedHostIds);

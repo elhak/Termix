@@ -18,7 +18,7 @@ import { EmptyState } from "@/components/empty-state";
 import { isElectron } from "@/lib/electron";
 import { reportCoreIssueUrl } from "@/lib/issue-url";
 import { cn } from "@/lib/utils";
-import { pluginKey } from "@/lib/plugin-i18n";
+import { pluginKey, pluginName } from "@/lib/plugin-i18n";
 import { PluginIcon } from "@/lib/plugin-icon";
 import type { Host } from "@/types/ui-types";
 import type { UserPreferences } from "@/main-axios";
@@ -121,9 +121,7 @@ export function SettingsTab({
         id: `plugin:${plugin.id}`,
         band: "plugins",
         labelKey: pluginKey(plugin.id, "plugin.name"),
-        label: t(pluginKey(plugin.id, "plugin.name"), {
-          defaultValue: plugin.name,
-        }),
+        label: pluginName(t, plugin),
         icon: SettingsIcon,
         pluginId: plugin.id,
         searchKeys: fields.flatMap((field) =>
@@ -387,7 +385,7 @@ export function SettingsTab({
                 )}
               </SettingsEmbedContext.Provider>
               {page.id === "keybindings" && <KeybindingsSettings />}
-              {page.id === "updates" && isAdmin && <UpdatesSettings />}
+              {page.id === "updates" && <UpdatesSettings isAdmin={isAdmin} />}
               {pluginFeature && (
                 <>
                   {pluginFeature.user && (

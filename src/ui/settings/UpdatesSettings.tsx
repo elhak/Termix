@@ -22,6 +22,8 @@ import { isElectron } from "@/lib/electron";
 import { isPrerelease } from "@/plugins/plugin-model";
 import { OPEN_PLUGINS_EVENT } from "@/plugins/open-plugins";
 import { docsUrl } from "@/lib/docs";
+import { pluginName } from "@/lib/plugin-i18n";
+import { DesktopUpdatesCard } from "./DesktopUpdatesCard";
 
 const DOCKER_BETA_IMAGE = "ghcr.io/termix-ssh/termix:beta";
 
@@ -61,7 +63,7 @@ function ReleaseRow({
   );
 }
 
-export function UpdatesSettings() {
+function InstanceUpdates() {
   const { t } = useTranslation();
   const [channel, setChannel] = useState<UpdateChannelState | null>(null);
   const [releases, setReleases] = useState<{
@@ -261,7 +263,7 @@ export function UpdatesSettings() {
         {betaPlugins.map((plugin) => (
           <SettingRow
             key={plugin.id}
-            label={plugin.name}
+            label={pluginName(t, plugin)}
             description={
               plugin.channel === "beta"
                 ? `v${plugin.version}`
@@ -314,6 +316,15 @@ export function UpdatesSettings() {
           </div>
         )}
       </SectionCard>
+    </div>
+  );
+}
+
+export function UpdatesSettings({ isAdmin }: { isAdmin: boolean }) {
+  return (
+    <div className="flex flex-col gap-3">
+      <DesktopUpdatesCard />
+      {isAdmin && <InstanceUpdates />}
     </div>
   );
 }

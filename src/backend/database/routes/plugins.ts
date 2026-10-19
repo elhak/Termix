@@ -17,8 +17,13 @@ import { describePluginFrontend } from "../../plugins/assets.js";
 import { invalidatePluginPermissionCache } from "../../plugins/permissions.js";
 import { getPluginPublicHttpRoutes } from "../../plugins/http.js";
 import { getPluginPublicWsRoutes } from "../../plugins/ws.js";
-import { MAX_UPLOAD_BYTES, PluginManageError } from "../../plugins/manage.js";
+import {
+  isLinkedDesktop,
+  MAX_UPLOAD_BYTES,
+  PluginManageError,
+} from "../../plugins/manage.js";
 import { parsePluginChannel } from "../../plugins/registry-index.js";
+import { RegistryError } from "../../plugins/registries.js";
 import {
   pluginDocsUrl,
   pluginEnvVars,
@@ -236,6 +241,11 @@ export async function listPreLoginPlugins(): Promise<
  *       it, and `locales` lists the languages it ships ("en" and xx_YY).
  *       `dependencies` and `optionalDependencies` let the loader activate
  *       frontends in the same order the server does.
+ *
+ *       On a desktop linked to a server, `runsOnServer` marks plugins that
+ *       only run on that server and stay off here on purpose, and, for
+ *       admins, `managedByServer` marks plugins whose on/off state the server
+ *       decides.
  *     tags:
  *       - Plugins
  *     responses:
@@ -253,6 +263,7 @@ router.get("/", authenticateJWT, async (req: Request, res: Response) => {
       userId,
       "admin.plugins.manage",
     );
+    const linked = await isLinkedDesktop();
 
     // One query for every plugin rather than one per plugin.
     const grantsByPlugin = new Map<string, string[]>();
@@ -285,6 +296,7 @@ router.get("/", authenticateJWT, async (req: Request, res: Response) => {
         let features: string[] = [];
         let docs: string | undefined;
         let env: PluginEnvVar[] = [];
+        let desktopMode: unknown = loaded?.manifest.desktop;
         try {
           const manifest = JSON.parse(record.manifestJson) as {
             contributes?: unknown;
@@ -299,7 +311,9 @@ router.get("/", authenticateJWT, async (req: Request, res: Response) => {
             env?: unknown;
             dependencies?: Record<string, string>;
             optionalDependencies?: Record<string, string>;
+            desktop?: unknown;
           };
+          desktopMode = loaded?.manifest.desktop ?? manifest?.desktop;
           contributes = manifest?.contributes ?? null;
           capabilities = Array.isArray(manifest?.capabilities)
             ? (manifest.capabilities as string[])
@@ -332,6 +346,7 @@ router.get("/", authenticateJWT, async (req: Request, res: Response) => {
           version: record.version,
           enabled: record.state === "enabled",
           state: loaded?.state ?? record.state,
+          runsOnServer: linked && desktopMode === "server",
           contributes,
           icon,
           dependencies,
@@ -357,6 +372,7 @@ router.get("/", authenticateJWT, async (req: Request, res: Response) => {
           features,
           env,
           signedBy: loaded?.signedBy ?? null,
+          managedByServer: linked && (await isManagedByLinkedServer(record.id)),
           capabilities,
           grantedCapabilities: grantsByPlugin.get(record.id) ?? [],
           lastError: loaded?.lastError ?? record.lastError ?? null,
@@ -380,9 +396,7 @@ router.get("/", authenticateJWT, async (req: Request, res: Response) => {
 });
 
 async function isManagedByLinkedServer(pluginId: string): Promise<boolean> {
-  if (process.env.ELECTRON_EMBEDDED !== "true") return false;
-  const { getLink } = await import("../../sync/client/link-store.js");
-  if (!(await getLink())) return false;
+  if (!(await isLinkedDesktop())) return false;
   const { isServerManaged } = await import("../../sync/client/plugins.js");
   return isServerManaged(pluginId);
 }
@@ -392,6 +406,7 @@ async function auditPluginAction(
   action: string,
   pluginId: string,
   details: Record<string, unknown> = {},
+  resourceType = "plugin",
 ): Promise<void> {
   const userId = (req as AuthenticatedRequest).userId as string;
   const { ipAddress, userAgent } = getRequestMeta(req);
@@ -400,7 +415,7 @@ async function auditPluginAction(
       userId,
       username: await getAuditUsername(userId),
       action,
-      resourceType: "plugin",
+      resourceType,
       resourceId: pluginId,
       resourceName: pluginId,
       details: JSON.stringify(details),
@@ -419,7 +434,7 @@ function sendManageError(
   fallback: string,
   operation: string,
 ): void {
-  if (error instanceof PluginManageError) {
+  if (error instanceof PluginManageError || error instanceof RegistryError) {
     res.status(error.status).json({
       error: error.message,
       code: error.code,
@@ -486,7 +501,7 @@ router.get(
  * /plugins/onboarding/apply:
  *   post:
  *     summary: Apply the onboarding plugin picker
- *     description: Sets every listed plugin to enabled, disabled or removed in one pass. Choices are first raised so that every kept plugin still has its hard dependencies (the adjustments list says which and why). Enabling runs dependencies first, disabling and removing run dependents first, and one plugin failing does not stop the rest. Removing a bundled plugin deletes it and its data; it can be reinstalled from the registry later. Clears the fresh-install pending flag. With dryRun nothing changes and the response lists what would.
+ *     description: Sets every listed plugin to enabled, disabled or removed in one pass. Choices are first raised so that every kept plugin still has its hard dependencies (the adjustments list says which and why). Enabling runs dependencies first, disabling and removing run dependents first, and one plugin failing does not stop the rest. Removing a bundled plugin deletes it and its data; it can be reinstalled from the registry later. Clears the fresh-install pending flag. With dryRun nothing changes and the response lists what would. On a linked desktop, locally managed plugins require version and capabilities matching the reviewed manifest when enabling.
  *     tags:
  *       - Plugins
  *     requestBody:
@@ -572,10 +587,308 @@ router.post(
 
 /**
  * @openapi
+ * /plugins/registries:
+ *   get:
+ *     summary: List the plugin registries
+ *     description: The official registry, which is always on, the community registry and whether it is on, and every custom registry an admin added with its pinned key fingerprint.
+ *     tags:
+ *       - Plugins
+ *     responses:
+ *       200:
+ *         description: The registries.
+ *       403:
+ *         description: The caller lacks admin.plugins.manage.
+ */
+router.get(
+  "/registries",
+  authenticateJWT,
+  requireManagePlugins,
+  async (_req: Request, res: Response) => {
+    try {
+      const { readRegistriesConfig } =
+        await import("../../plugins/registries.js");
+      const { officialSource, communitySource } =
+        await import("../../plugins/registry-index.js");
+      const config = await readRegistriesConfig();
+      res.json({
+        managedByServer: await isLinkedDesktop(),
+        official: { id: "official", url: officialSource().url },
+        community: {
+          id: "community",
+          url: communitySource().url,
+          enabled: config.community.enabled,
+        },
+        custom: config.custom.map((entry) => ({
+          id: entry.id,
+          name: entry.name,
+          url: entry.url,
+          keyId: entry.keyId,
+          enabled: entry.enabled,
+          addedAt: entry.addedAt,
+        })),
+      });
+    } catch (error) {
+      sendManageError(
+        res,
+        error,
+        "Failed to read plugin registries",
+        "plugin_registry",
+      );
+    }
+  },
+);
+
+/**
+ * @openapi
+ * /plugins/registries/preview:
+ *   post:
+ *     summary: Read a registry index before adding it
+ *     description: Fetches the index at url and returns its name, the id it would get, how many plugins it lists and the fingerprint of the key it signs with. Nothing is saved. The index must list a publicKey.
+ *     tags:
+ *       - Plugins
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - url
+ *             properties:
+ *               url:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: What the registry would be added as.
+ *       400:
+ *         description: Not an https URL, or the index has no publicKey.
+ *       403:
+ *         description: The caller lacks admin.plugins.manage.
+ *       409:
+ *         description: The registry is already added.
+ *       502:
+ *         description: The index could not be read.
+ */
+router.post(
+  "/registries/preview",
+  authenticateJWT,
+  requireManagePlugins,
+  async (req: Request, res: Response) => {
+    if (await refuseOnLinkedDesktop(res)) return;
+    try {
+      const { previewRegistry } = await import("../../plugins/registries.js");
+      res.json(await previewRegistry(req.body?.url));
+    } catch (error) {
+      sendManageError(
+        res,
+        error,
+        "Failed to read the registry",
+        "plugin_registry",
+      );
+    }
+  },
+);
+
+/**
+ * @openapi
+ * /plugins/registries:
+ *   post:
+ *     summary: Add a custom plugin registry
+ *     description: Reads the index again and pins the key it names. keyId must be the fingerprint the preview showed, otherwise the answer is 409 KEY_MISMATCH and nothing is saved. Every plugin installed from it must be signed by that key.
+ *     tags:
+ *       - Plugins
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - url
+ *               - keyId
+ *             properties:
+ *               url:
+ *                 type: string
+ *               keyId:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: The added registry.
+ *       400:
+ *         description: Not an https URL, no publicKey, or too many registries.
+ *       403:
+ *         description: The caller lacks admin.plugins.manage.
+ *       409:
+ *         description: Already added, or the key changed since the preview.
+ *       502:
+ *         description: The index could not be read.
+ */
+router.post(
+  "/registries",
+  authenticateJWT,
+  requireManagePlugins,
+  async (req: Request, res: Response) => {
+    if (await refuseOnLinkedDesktop(res)) return;
+    try {
+      const { addRegistry } = await import("../../plugins/registries.js");
+      const entry = await addRegistry(req.body?.url, req.body?.keyId);
+      await auditPluginAction(
+        req,
+        "add_plugin_registry",
+        entry.id,
+        { url: entry.url, keyId: entry.keyId },
+        "plugin_registry",
+      );
+      res.json({
+        id: entry.id,
+        name: entry.name,
+        url: entry.url,
+        keyId: entry.keyId,
+        enabled: entry.enabled,
+        addedAt: entry.addedAt,
+      });
+    } catch (error) {
+      sendManageError(
+        res,
+        error,
+        "Failed to add the registry",
+        "plugin_registry",
+      );
+    }
+  },
+);
+
+/**
+ * @openapi
+ * /plugins/registries/{id}:
+ *   patch:
+ *     summary: Turn a plugin registry on or off
+ *     description: Works for community and custom registries. Plugins already installed from a registry that is off keep running but get no updates.
+ *     tags:
+ *       - Plugins
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - enabled
+ *             properties:
+ *               enabled:
+ *                 type: boolean
+ *     responses:
+ *       200:
+ *         description: The registry was changed.
+ *       400:
+ *         description: Invalid body, or the official registry.
+ *       403:
+ *         description: The caller lacks admin.plugins.manage.
+ *       404:
+ *         description: No such registry.
+ */
+router.patch(
+  "/registries/:id",
+  authenticateJWT,
+  requireManagePlugins,
+  async (req: Request, res: Response) => {
+    const id = String(req.params.id);
+    const enabled = req.body?.enabled;
+    if (typeof enabled !== "boolean") {
+      res.status(400).json({ error: "enabled must be a boolean" });
+      return;
+    }
+    if (await refuseOnLinkedDesktop(res)) return;
+    try {
+      const { setRegistryEnabled } =
+        await import("../../plugins/registries.js");
+      await setRegistryEnabled(id, enabled);
+      await auditPluginAction(
+        req,
+        enabled ? "enable_plugin_registry" : "disable_plugin_registry",
+        id,
+        {},
+        "plugin_registry",
+      );
+      res.json({ id, enabled });
+    } catch (error) {
+      sendManageError(
+        res,
+        error,
+        "Failed to change the registry",
+        "plugin_registry",
+      );
+    }
+  },
+);
+
+/**
+ * @openapi
+ * /plugins/registries/{id}:
+ *   delete:
+ *     summary: Remove a custom plugin registry
+ *     description: Refused with 409 REGISTRY_IN_USE while plugins installed from it remain, since its key has to stay trusted for them to load.
+ *     tags:
+ *       - Plugins
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: The registry was removed.
+ *       400:
+ *         description: Official and community can only be turned off.
+ *       403:
+ *         description: The caller lacks admin.plugins.manage.
+ *       404:
+ *         description: No such registry.
+ *       409:
+ *         description: Plugins from it are still installed.
+ */
+router.delete(
+  "/registries/:id",
+  authenticateJWT,
+  requireManagePlugins,
+  async (req: Request, res: Response) => {
+    const id = String(req.params.id);
+    if (await refuseOnLinkedDesktop(res)) return;
+    try {
+      const { removeRegistry } = await import("../../plugins/registries.js");
+      await removeRegistry(id);
+      await auditPluginAction(
+        req,
+        "remove_plugin_registry",
+        id,
+        {},
+        "plugin_registry",
+      );
+      res.json({ id });
+    } catch (error) {
+      sendManageError(
+        res,
+        error,
+        "Failed to remove the registry",
+        "plugin_registry",
+      );
+    }
+  },
+);
+
+/**
+ * @openapi
  * /plugins/{id}/state:
  *   patch:
  *     summary: Enable or disable a plugin
- *     description: Persists the new state and starts or stops the plugin immediately. Disabling releases everything the plugin owns, including any port it was listening on. Enabling also starts any installed hard dependency that is off, and disabling also stops the running plugins that depend on it. With dryRun nothing changes and the response lists what would.
+ *     description: Persists the new state and starts or stops the plugin immediately. Disabling releases everything the plugin owns, including any port it was listening on. Enabling also starts any installed hard dependency that is off, and disabling also stops the running plugins that depend on it. With dryRun nothing changes and the response lists what would. On a linked desktop, locally managed plugins require version and capabilities matching the reviewed manifest when enabling.
  *     tags:
  *       - Plugins
  *     parameters:
@@ -597,6 +910,12 @@ router.post(
  *             properties:
  *               enabled:
  *                 type: boolean
+ *               version:
+ *                 type: string
+ *               capabilities:
+ *                 type: array
+ *                 items:
+ *                   type: string
  *     responses:
  *       200:
  *         description: The plugin's new state.
@@ -650,7 +969,26 @@ router.patch(
         return;
       }
 
-      const result = await setPluginState(pluginId, enabled);
+      let result;
+      if (enabled && (await isLinkedDesktop())) {
+        const version = readVersion(req.body);
+        const capabilities = readCapabilities(req.body);
+        if (version === null || capabilities === null) {
+          res
+            .status(400)
+            .json({ error: "Invalid plugin version or capabilities" });
+          return;
+        }
+        const { enablePluginWithConsent } =
+          await import("../../plugins/manage.js");
+        result = await enablePluginWithConsent(pluginId, {
+          version,
+          capabilities,
+          userId: (req as AuthenticatedRequest).userId as string,
+        });
+      } else {
+        result = await setPluginState(pluginId, enabled);
+      }
       await auditPluginAction(
         req,
         enabled ? "enable_plugin" : "disable_plugin",
@@ -1597,10 +1935,11 @@ function readVersion(body: unknown): string | undefined | null {
  * @openapi
  * /plugins/registry:
  *   get:
- *     summary: List the plugins in the official registry
+ *     summary: List the plugins in every registry that is on
  *     description: >
- *       Fetches the official registry index (cached for 15 minutes unless
- *       refresh is set) and merges it with what is installed here: the
+ *       Fetches the index of every registry that is on (each cached for 15
+ *       minutes unless refresh is set), with each one's status under
+ *       registries, and merges them with what is installed here: the
  *       installed version, the newest release this build can run, whether an
  *       update asks for new capabilities, and the pin and auto-update choices.
  *     tags:
@@ -1741,10 +2080,10 @@ router.post(
  * @openapi
  * /plugins/{id}/install:
  *   post:
- *     summary: Install a plugin from the official registry
+ *     summary: Install a plugin from a registry
  *     description: >
- *       Downloads the release, checks its sha256 and signature against a key
- *       this build trusts, loads it, grants the capabilities it declares and
+ *       Downloads the release, checks its sha256 and signature against the keys of
+ *       the registry it comes from, loads it, grants the capabilities it declares and
  *       starts it along with any installed dependency that is off. Without a
  *       version the newest compatible release is used; naming an older one
  *       pins the plugin there. A bundled plugin at its shipped version needs
@@ -1774,6 +2113,9 @@ router.post(
  *                 type: string
  *                 enum: [stable, beta]
  *                 description: The channel to follow. beta installs the newest beta when it is newer than stable.
+ *               registryId:
+ *                 type: string
+ *                 description: The registry to install from, official when unset. It must be turned on, and only the official registry can offer an official plugin id.
  *               capabilities:
  *                 type: array
  *                 items:
@@ -1786,9 +2128,9 @@ router.post(
  *       403:
  *         description: The caller lacks admin.plugins.manage.
  *       404:
- *         description: Not in the official registry.
+ *         description: Not in that registry.
  *       409:
- *         description: Already installed, incompatible, the consent does not match, or managed by a linked server.
+ *         description: Already installed, incompatible, the consent does not match, the registry is off, the id belongs to an official plugin, or managed by a linked server.
  *       502:
  *         description: The registry could not be reached.
  */
@@ -1804,15 +2146,19 @@ router.post(
       req.body?.channel === undefined
         ? "stable"
         : parsePluginChannel(req.body.channel);
+    const registryId =
+      req.body?.registryId === undefined ? undefined : req.body.registryId;
     if (
       !ID_PATTERN.test(pluginId) ||
       version === null ||
       capabilities === null ||
-      channel === null
+      channel === null ||
+      (registryId !== undefined &&
+        (typeof registryId !== "string" || !ID_PATTERN.test(registryId)))
     ) {
-      res
-        .status(400)
-        .json({ error: "Invalid plugin id, version, channel or capabilities" });
+      res.status(400).json({
+        error: "Invalid plugin id, version, channel, registry or capabilities",
+      });
       return;
     }
     if (await refuseOnLinkedDesktop(res)) return;
@@ -1822,11 +2168,13 @@ router.post(
       const result = await installPlugin(pluginId, {
         version,
         channel,
+        registryId,
         userId,
         capabilities,
       });
       await auditPluginAction(req, "install_plugin", pluginId, {
         version: result.version,
+        registryId: registryId ?? "official",
         capabilities,
       });
       res.json(result);
@@ -1847,7 +2195,7 @@ router.post(
  *   post:
  *     summary: Update or change the installed version of a plugin
  *     description: >
- *       Swaps in another release from the official registry, newer or older.
+ *       Swaps in another release from the registry the plugin came from, newer or older.
  *       If the release declares capabilities the installed one does not, the
  *       request must set acceptCapabilities and list exactly those added
  *       capabilities in capabilities, otherwise it answers 409 with code

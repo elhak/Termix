@@ -1,6 +1,6 @@
 cask "termix" do
-  version "26.10.0"
-  sha256 "66a76a62fbea3306bdf35b0951e9b1200fd1a084a95b4fee9d40edd6e326e11a"
+  version "26.10.2"
+  sha256 "9df1850b5f75a3c0a1b3876847d46b7b4ff993aa1e50da55f4c88819308ba223"
 
   url "https://github.com/Termix-SSH/Termix/releases/download/v#{version}/termix_macos_universal_dmg.dmg"
   name "Termix"
@@ -11,6 +11,8 @@ cask "termix" do
     url :url
     strategy :github_latest
   end
+
+  auto_updates true
 
   app "Termix.app"
 

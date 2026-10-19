@@ -66,7 +66,8 @@ import type { FontSizeId, ThemeId, UiFontId } from "@/types/ui-types";
 import { toast } from "sonner";
 import { changeAppLanguage, normalizeLanguageCode } from "@/i18n/i18n";
 import { Select2 } from "@/components/select2";
-import { LANGUAGES, THEMES } from "@/settings/appearance/appearance-controls";
+import { THEMES } from "@/settings/appearance/appearance-controls";
+import { LANGUAGES } from "@/i18n/languages";
 import { clearLocalAdaptivePreferences } from "@/lib/local-adaptive-preferences";
 import { reportBetaFeedbackUrl } from "@/lib/issue-url";
 import { isPrerelease } from "@/plugins/plugin-model";
@@ -551,6 +552,9 @@ export function UserProfilePanel({
   );
   const [expandAppRailOnHover, setExpandAppRailOnHover] = useState(() =>
     readRailPreference("expandAppRailOnHover"),
+  );
+  const [appRailHoverPushes, setAppRailHoverPushes] = useState(() =>
+    readRailPreference("appRailHoverPushesContent"),
   );
   const [showPinAppRailButton, setShowPinAppRailButton] = useState(() =>
     readRailPreference("showPinAppRailButton"),
@@ -1680,6 +1684,21 @@ export function UserProfilePanel({
                 onChange={(v) => {
                   setExpandAppRailOnHover(v);
                   setRailPreference("expandAppRailOnHover", v);
+                }}
+              />
+            </SettingRow>
+            <SettingRow
+              label={t("newUi.sidebar.userProfile.appRailHoverPushesContent")}
+              description={t(
+                "newUi.sidebar.userProfile.appRailHoverPushesContentDesc",
+              )}
+            >
+              <FakeSwitch
+                checked={appRailHoverPushes}
+                disabled={!expandAppRailOnHover}
+                onChange={(v) => {
+                  setAppRailHoverPushes(v);
+                  setRailPreference("appRailHoverPushesContent", v);
                 }}
               />
             </SettingRow>

@@ -22,9 +22,10 @@ const plugin = {
   capabilities: [],
   contributes: {},
   versions: [],
-  installCount: null,
-  installCountSource: null,
+  downloads: null,
+  managedByServer: false,
 };
+let linked = false;
 
 vi.mock("@/plugins/use-plugins-manager", () => ({
   usePluginsManager: () => ({
@@ -33,13 +34,14 @@ vi.mock("@/plugins/use-plugins-manager", () => ({
     refreshing: false,
     refresh: vi.fn(),
     registryError: null,
-    managedByServer: false,
+    managedByServer: linked,
     busy: new Set(),
     consent: null,
     setConsent: vi.fn(),
     confirmConsent: vi.fn(),
     developerMode: false,
     signedOnly: false,
+    registries: [],
   }),
 }));
 
@@ -56,19 +58,38 @@ async function renderTab() {
   );
 }
 
-beforeEach(() => localStorage.clear());
+beforeEach(() => {
+  localStorage.clear();
+  linked = false;
+  plugin.managedByServer = false;
+});
 afterEach(cleanup);
 
 describe("PluginsTab", () => {
-  it("tells people community plugins are coming and links the guide", async () => {
+  it("points to the Registries tab and links the submit guide", async () => {
     await renderTab();
     fireEvent.click(screen.getByText(en.plugins.manager.tabs.browse));
 
     expect(
-      screen.getByText(en.plugins.manager.communitySoon, { exact: false }),
+      screen.getByText(en.plugins.manager.registries.browseHint, {
+        exact: false,
+      }),
     ).toBeTruthy();
     const link = screen.getByText(en.plugins.manager.communitySubmit);
     expect(link.getAttribute("href")).toBe(docsUrl("communityRegistry"));
+  });
+
+  it("hides installed plugins in Browse until shown", async () => {
+    await renderTab();
+    fireEvent.click(screen.getByText(en.plugins.manager.tabs.browse));
+
+    expect(screen.queryByText("Demo Plugin")).toBeNull();
+    expect(screen.getByText(en.plugins.manager.allInstalled)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("switch"));
+
+    expect(screen.getByText("Demo Plugin")).toBeTruthy();
+    expect(localStorage.getItem("pluginsTab.browseInstalled")).toBe("show");
   });
 
   it("switches to a table and remembers it", async () => {
@@ -107,5 +128,18 @@ describe("PluginsTab", () => {
       "[style*='grid-template-columns']",
     );
     expect(grid?.style.gridTemplateColumns).toContain("auto-fill");
+  });
+
+  it("lets a linked desktop switch a plugin its server does not decide", async () => {
+    linked = true;
+    await renderTab();
+    const toggle = () =>
+      screen.getByRole("button", { name: en.plugins.manager.disable });
+    expect(toggle().hasAttribute("disabled")).toBe(false);
+
+    cleanup();
+    plugin.managedByServer = true;
+    await renderTab();
+    expect(toggle().hasAttribute("disabled")).toBe(true);
   });
 });

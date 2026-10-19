@@ -61,6 +61,7 @@ function setup() {
     getC2SRelayHeaders: headers,
     getWebSocketOptions: (_url: string, options: unknown) => options,
     attachC2SAuth: vi.fn(),
+    keepC2SSocketAlive: vi.fn(),
     logToFile: vi.fn(),
     emitC2STunnelStatuses: vi.fn(),
     checkLocalPortAvailable: async () => ({ available: true }),
@@ -144,6 +145,35 @@ describe("client tunnel runtime authentication", () => {
     expect(sockets).toHaveLength(1);
   });
 
+  it("keeps the relay's reason when it closes after an error", async () => {
+    const { context, runtimes, sockets } = setup();
+    const runtime = { status: { connected: true } };
+    runtimes.set("web", runtime);
+    const test = context.testC2SRelay(
+      { name: "web" },
+      "127.0.0.1",
+      8443,
+      null,
+      runtime,
+    );
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0].emit(
+      "message",
+      Buffer.from(
+        JSON.stringify({
+          type: "error",
+          error: "Target 127.0.0.1:8443 refused",
+        }),
+      ),
+      false,
+    );
+    sockets[0].close();
+    expect(await test).toMatchObject({ success: false });
+    expect(runtimes.get("web").status.reason).toBe(
+      "Target 127.0.0.1:8443 refused",
+    );
+  });
+
   it("keeps the tunnel connected when one of its connections fails", async () => {
     const { context, runtimes, sockets } = setup();
     runtimes.set("web", { status: { connected: true, status: "CONNECTED" } });
@@ -175,5 +205,34 @@ describe("client tunnel runtime authentication", () => {
       connected: false,
       reason: "expired",
     });
+  });
+});
+
+describe("client tunnel socket keepalive", () => {
+  it("pings an open socket until it closes", () => {
+    vi.useFakeTimers();
+    try {
+      const context = vm.createContext({
+        setInterval,
+        clearInterval,
+        WebSocket: { OPEN: 1 },
+      });
+      vm.runInContext(
+        section("function keepC2SSocketAlive(", "// C2S (client-to-server)"),
+        context,
+      );
+      const ws = Object.assign(new EventEmitter(), {
+        readyState: 1,
+        ping: vi.fn(),
+      });
+      context.keepC2SSocketAlive(ws);
+      vi.advanceTimersByTime(50_000);
+      expect(ws.ping).toHaveBeenCalledTimes(2);
+      ws.emit("close");
+      vi.advanceTimersByTime(50_000);
+      expect(ws.ping).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
