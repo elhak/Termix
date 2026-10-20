@@ -26,7 +26,7 @@ COPY . .
 RUN find public/fonts -name "*.ttf" ! -name "*Regular.ttf" ! -name "*Bold.ttf" ! -name "*Italic.ttf" -delete
 
 RUN npm cache clean --force && \
-    NODE_OPTIONS="--max-old-space-size=3072" npm run build
+    TERMIX_RUNTIME_BASE_PATH=true NODE_OPTIONS="--max-old-space-size=3072" npm run build
 
 # Stage 3: Build backend
 FROM deps AS backend-builder
@@ -34,7 +34,9 @@ WORKDIR /app
 
 COPY . .
 
-RUN npm run build:backend
+# Bundled plugin downloads show in the plugin store, so keep them between builds.
+RUN --mount=type=cache,target=/app/node_modules/.cache/termix-bundled-plugins \
+    npm run build:backend
 
 # Stage 4: Download OPKSSH binary for the target platform so the image works offline
 FROM node:24-slim AS opkssh-downloader
@@ -72,12 +74,15 @@ COPY vendor ./vendor
 
 COPY scripts/patch-ssh2-agent.cjs ./scripts/
 
+# ssh2's native crypto crashes Node 24 when a cipher is freed, so ssh2 uses
+# OpenSSL instead (chacha20-poly1305 is then left out).
 RUN npm ci --omit=dev --ignore-scripts && \
     node scripts/patch-ssh2-agent.cjs && \
     rm -rf node_modules/better-sqlite3/prebuilds && \
     npm run build-release --prefix node_modules/better-sqlite3 && \
     test -f node_modules/better-sqlite3/build/Release/better_sqlite3.node && \
-    npm rebuild bcryptjs ssh2 && \
+    npm rebuild bcryptjs && \
+    rm -rf node_modules/ssh2/lib/protocol/crypto/build && \
     npm cache clean --force
 
 # Stage 6: Final optimized image

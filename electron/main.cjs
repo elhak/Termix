@@ -29,12 +29,21 @@ const pty = require("node-pty");
 const WebSocket = require("ws");
 const linkedServer = require("./linked-server.cjs");
 const desktopSettings = require("./desktop-settings.cjs");
+const autoUpdates = require("./auto-updater.cjs");
 const { launchNativeRdp } = require("./native-rdp.cjs");
 const { isCloseActiveTabInput } = require("./keyboard-shortcuts.cjs");
 const { quitApp } = require("./app-quit.cjs");
 const { selectLinuxPasswordStore } = require("./linux-password-store.cjs");
 const { resolveLocalShell, repairSpawnHelpers } = require("./local-shell.cjs");
-const { registerLocalFileHandlers } = require("./local-files.cjs");
+const {
+  registerLocalFileHandlers,
+  setLocalBackendPort,
+} = require("./local-files.cjs");
+const {
+  EXTERNAL_EDITOR_SETTING,
+  isLaunchableFileName,
+} = require("./external-editor.cjs");
+const { isExternalLoginUrl, isCallbackPort } = require("./external-login.cjs");
 
 const localTerminalSessions = new Map();
 
@@ -433,14 +442,6 @@ function isInsecureModeEnabled() {
   );
 }
 
-function getOrigin(url) {
-  try {
-    return new URL(url).origin;
-  } catch {
-    return null;
-  }
-}
-
 function isPrivateNetworkHost(hostname) {
   if (
     hostname === "localhost" ||
@@ -484,7 +485,7 @@ function isInvalidCertificateAllowedForUrl(url) {
   // allows a self-signed certificate.
   const linked = linkedServer.getLinkedServer();
   if (!linked?.allowInvalidCertificate) return false;
-  return getOrigin(url) === linked.origin;
+  return linkedServer.isLinkedOrigin(url);
 }
 
 function getTlsVerificationOptions(url) {
@@ -699,21 +700,9 @@ let tray = null;
 let isQuitting = false;
 const tempFiles = new Map();
 const externalEditorSessions = new Map();
-const terminalAgentSessions = new Map();
-
-const AI_SETTINGS_DEFAULTS = {
-  enabled: false,
-  provider: "openai-compatible",
-  baseUrl: "https://api.openai.com/v1",
-  model: "gpt-4.1-mini",
-  includeContext: true,
-};
-const AI_REQUEST_TIMEOUT_MS = 30000;
-const AI_TEST_TIMEOUT_MS = 15000;
-const AI_MAX_PROMPT_LENGTH = 2000;
-const AI_MAX_CONTEXT_LENGTH = 6000;
-const AI_MAX_COMMAND_LENGTH = 1000;
-const AI_AGENT_HISTORY_LIMIT = 12;
+// Paths the user picked in an open dialog this session. Only these may be
+// saved as the external editor, so the renderer cannot name an executable.
+const dialogChosenPaths = new Set();
 
 const isDev = process.env.NODE_ENV === "development" || !app.isPackaged;
 const appRoot = isDev ? process.cwd() : path.join(__dirname, "..");
@@ -740,427 +729,6 @@ function decodeFileContent(content, encoding) {
     return Buffer.from(String(content || ""), "base64");
   }
   return Buffer.from(String(content || ""), "utf8");
-}
-
-function getAiSettingsPath() {
-  return path.join(app.getPath("userData"), "ai-settings.json");
-}
-
-function normalizeAiBaseUrl(baseUrl) {
-  const trimmed = String(baseUrl || "")
-    .trim()
-    .replace(/\/+$/, "");
-  if (!trimmed) throw new Error("AI base URL is required");
-
-  const parsed = new URL(trimmed);
-  if (!["http:", "https:"].includes(parsed.protocol)) {
-    throw new Error("AI base URL must use http or https");
-  }
-  if (parsed.username || parsed.password) {
-    throw new Error("AI base URL cannot include credentials");
-  }
-
-  return parsed.toString().replace(/\/+$/, "");
-}
-
-function getAiChatCompletionsUrl(baseUrl) {
-  return `${normalizeAiBaseUrl(baseUrl)}/chat/completions`;
-}
-
-function readAiSettingsFile() {
-  try {
-    const settingsPath = getAiSettingsPath();
-    if (!fs.existsSync(settingsPath)) return {};
-    return JSON.parse(fs.readFileSync(settingsPath, "utf8"));
-  } catch (error) {
-    logToFile("Failed to read AI settings:", error.message);
-    return {};
-  }
-}
-
-function writeAiSettingsFile(settings) {
-  const userDataPath = app.getPath("userData");
-  if (!fs.existsSync(userDataPath)) {
-    fs.mkdirSync(userDataPath, { recursive: true });
-  }
-  fs.writeFileSync(getAiSettingsPath(), JSON.stringify(settings, null, 2));
-}
-
-function encodeAiApiKey(apiKey) {
-  if (!getSafeStorageAvailable()) {
-    throw new Error(
-      "Secure storage is not available on this device. AI API key was not saved.",
-    );
-  }
-  return {
-    encrypted: true,
-    value: safeStorage.encryptString(apiKey).toString("base64"),
-  };
-}
-
-function decodeAiApiKey(record) {
-  if (!record || !record.encrypted || !getSafeStorageAvailable()) {
-    return null;
-  }
-
-  try {
-    return safeStorage.decryptString(Buffer.from(record.value, "base64"));
-  } catch (error) {
-    logToFile("Failed to decrypt AI API key:", error.message);
-    return null;
-  }
-}
-
-function maskAiApiKey(apiKey) {
-  if (!apiKey) return "";
-  if (apiKey.length <= 8) return "*".repeat(apiKey.length);
-  return `${apiKey.slice(0, 6)}${"*".repeat(Math.max(0, apiKey.length - 10))}${apiKey.slice(-4)}`;
-}
-
-function getStoredAiSettings() {
-  const raw = readAiSettingsFile();
-  const apiKey = decodeAiApiKey(raw.apiKey);
-  return {
-    ...AI_SETTINGS_DEFAULTS,
-    enabled:
-      typeof raw.enabled === "boolean"
-        ? raw.enabled
-        : AI_SETTINGS_DEFAULTS.enabled,
-    provider: "openai-compatible",
-    baseUrl:
-      typeof raw.baseUrl === "string" && raw.baseUrl.trim()
-        ? raw.baseUrl
-        : AI_SETTINGS_DEFAULTS.baseUrl,
-    model:
-      typeof raw.model === "string" && raw.model.trim()
-        ? raw.model
-        : AI_SETTINGS_DEFAULTS.model,
-    includeContext:
-      typeof raw.includeContext === "boolean"
-        ? raw.includeContext
-        : AI_SETTINGS_DEFAULTS.includeContext,
-    apiKey,
-    hasApiKey: !!apiKey,
-  };
-}
-
-function serializeAiSettings(settings) {
-  return {
-    enabled: settings.enabled,
-    provider: "openai-compatible",
-    baseUrl: settings.baseUrl,
-    model: settings.model,
-    includeContext: settings.includeContext,
-    hasApiKey: !!settings.apiKey,
-    apiKey: maskAiApiKey(settings.apiKey),
-    secureStorageAvailable: getSafeStorageAvailable(),
-  };
-}
-
-function saveAiSettings(update = {}) {
-  const raw = readAiSettingsFile();
-  const current = getStoredAiSettings();
-  const baseUrl =
-    update.baseUrl !== undefined
-      ? normalizeAiBaseUrl(update.baseUrl)
-      : current.baseUrl;
-  const model =
-    update.model !== undefined
-      ? String(update.model || "").trim()
-      : current.model;
-
-  if (!model) throw new Error("AI model is required");
-
-  const next = {
-    enabled:
-      typeof update.enabled === "boolean" ? update.enabled : current.enabled,
-    provider: "openai-compatible",
-    baseUrl,
-    model,
-    includeContext:
-      typeof update.includeContext === "boolean"
-        ? update.includeContext
-        : current.includeContext,
-    apiKey: raw.apiKey,
-    updatedAt: new Date().toISOString(),
-  };
-
-  if (update.clearApiKey) {
-    delete next.apiKey;
-  } else if (typeof update.apiKey === "string" && update.apiKey.trim()) {
-    next.apiKey = encodeAiApiKey(update.apiKey.trim());
-  }
-
-  writeAiSettingsFile(next);
-  return serializeAiSettings(getStoredAiSettings());
-}
-
-function redactAiText(value) {
-  let text = typeof value === "string" ? value : "";
-  return text
-    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
-    .replace(
-      /\b(password|passwd|pwd)\s*[:=]\s*("[^"]*"|'[^']*'|\S+)/gi,
-      "$1=[REDACTED]",
-    )
-    .replace(
-      /\b(token|api[_-]?key|secret)\s*[:=]\s*("[^"]*"|'[^']*'|\S+)/gi,
-      "$1=[REDACTED]",
-    )
-    .replace(
-      /(Authorization:\s*Bearer\s+)[A-Za-z0-9._~+/=-]+/gi,
-      "$1[REDACTED]",
-    )
-    .replace(
-      /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
-      "[REDACTED PRIVATE KEY]",
-    );
-}
-
-function buildAiMessages(prompt, context = {}) {
-  const safePrompt = redactAiText(prompt).slice(0, AI_MAX_PROMPT_LENGTH);
-  const safeContext = JSON.stringify({
-    hostName: redactAiText(context.hostName).slice(0, 120),
-    username: redactAiText(context.username).slice(0, 120),
-    currentCommand: redactAiText(context.currentCommand).slice(0, 500),
-    promptPath: redactAiText(context.promptPath).slice(0, 300),
-    visibleOutput: redactAiText(context.visibleOutput).slice(
-      -AI_MAX_CONTEXT_LENGTH,
-    ),
-  });
-
-  return [
-    {
-      role: "system",
-      content:
-        "You convert natural language into one shell command. Return strict JSON only with keys command, explanation, warnings. The command must be a single line and must not include markdown.",
-    },
-    {
-      role: "user",
-      content: `Request:\n${safePrompt}\n\nTerminal context JSON:\n${safeContext}`,
-    },
-  ];
-}
-
-function parseAiJsonObject(content) {
-  try {
-    return JSON.parse(content);
-  } catch {
-    const match = String(content || "").match(/\{[\s\S]*\}/);
-    if (!match) throw new Error("AI response was not valid JSON");
-    return JSON.parse(match[0]);
-  }
-}
-
-function validateGeneratedAiCommand(value) {
-  if (typeof value !== "string") {
-    throw new Error("AI response did not include a command");
-  }
-
-  const command = value.trim();
-  if (!command) throw new Error("AI returned an empty command");
-  if (command.length > AI_MAX_COMMAND_LENGTH) {
-    throw new Error("AI command is too long");
-  }
-  if (/[\r\n\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(command)) {
-    throw new Error("AI command must be a single safe line");
-  }
-  return command;
-}
-
-function getAiCommandWarnings(command) {
-  const checks = [
-    [
-      /\brm\s+(-[^\s]*[rf][^\s]*|-[^\s]*[fr][^\s]*)\b/,
-      "Recursive/forced delete",
-    ],
-    [
-      /\bmkfs(\.[a-z0-9]+)?\b|\bdd\s+.*\bof=\/dev\//,
-      "Disk formatting or raw disk write",
-    ],
-    [/\b(shutdown|reboot|halt|poweroff)\b/, "System power action"],
-    [/\bchmod\s+(-[^\s]*R|--recursive)\b/, "Recursive permission change"],
-    [/\bchown\s+(-[^\s]*R|--recursive)\b/, "Recursive ownership change"],
-    [
-      /\b(curl|wget)\b.*\|\s*(sh|bash|zsh|sudo)\b/,
-      "Downloaded script execution",
-    ],
-  ];
-  return checks
-    .filter(([pattern]) => pattern.test(command))
-    .map(([, warning]) => warning);
-}
-
-function getAiAgentCommandWarnings(command) {
-  const warnings = getAiCommandWarnings(command);
-  if (/\bsudo\b/.test(command)) {
-    warnings.push("Requires sudo");
-  }
-  return Array.from(new Set(warnings));
-}
-
-function buildAiAgentMessages(session, payload = {}, includeContext = true) {
-  const context = includeContext ? payload.context || {} : {};
-  const safeContext = JSON.stringify({
-    hostName: redactAiText(context.hostName).slice(0, 120),
-    username: redactAiText(context.username).slice(0, 120),
-    currentCommand: redactAiText(context.currentCommand).slice(0, 500),
-    promptPath: redactAiText(context.promptPath).slice(0, 300),
-    visibleOutput: redactAiText(context.visibleOutput).slice(
-      -AI_MAX_CONTEXT_LENGTH,
-    ),
-  });
-  const recentHistory = session.history
-    .filter((entry) => includeContext || entry.role !== "terminal")
-    .slice(-AI_AGENT_HISTORY_LIMIT);
-
-  return [
-    {
-      role: "system",
-      content:
-        'You are Termix Agent Mode. You help operate an already-open SSH terminal session through Termix. You never receive SSH credentials and cannot open your own SSH connection. Return strict JSON only. Choose exactly one action: {"type":"run_command","command":"single shell command","message":"why"}, {"type":"ask_user","message":"question"}, or {"type":"final_answer","message":"summary"}. Commands must be a single non-interactive shell line and must not include markdown.',
-    },
-    {
-      role: "user",
-      content: `Initial task:\n${redactAiText(session.prompt).slice(0, AI_MAX_PROMPT_LENGTH)}\n\nMode: ${session.mode}\nTerminal context JSON:\n${safeContext}\n\nRecent transcript JSON:\n${JSON.stringify(recentHistory)}`,
-    },
-  ];
-}
-
-function validateAiAgentAction(value) {
-  const action =
-    value?.action && typeof value.action === "object" ? value.action : value;
-  const type = String(action?.type || "").trim();
-
-  if (type === "run_command") {
-    const command = validateGeneratedAiCommand(action.command);
-    const warnings = Array.isArray(action.warnings)
-      ? action.warnings.filter((warning) => typeof warning === "string")
-      : [];
-    const allWarnings = Array.from(
-      new Set([...warnings, ...getAiAgentCommandWarnings(command)]),
-    );
-    return {
-      type,
-      command,
-      message: typeof action.message === "string" ? action.message.trim() : "",
-      warnings: allWarnings,
-      risky: allWarnings.length > 0,
-    };
-  }
-
-  if (type === "ask_user" || type === "final_answer") {
-    const message =
-      typeof action.message === "string"
-        ? action.message.trim()
-        : typeof action.answer === "string"
-          ? action.answer.trim()
-          : "";
-    if (!message) {
-      throw new Error("AI agent response did not include a message");
-    }
-    return {
-      type,
-      message,
-      warnings: [],
-      risky: false,
-    };
-  }
-
-  throw new Error("AI agent returned an unsupported action");
-}
-
-async function requestAiAgentAction(settings, session, payload, timeoutMs) {
-  if (!settings.enabled) throw new Error("AI integration is disabled");
-  if (!settings.apiKey) throw new Error("AI API key is not configured");
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const response = await fetch(getAiChatCompletionsUrl(settings.baseUrl), {
-      method: "POST",
-      signal: controller.signal,
-      redirect: "error",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${settings.apiKey}`,
-      },
-      body: JSON.stringify({
-        model: settings.model,
-        messages: buildAiAgentMessages(
-          session,
-          payload,
-          settings.includeContext === true,
-        ),
-        temperature: 0.1,
-        response_format: { type: "json_object" },
-      }),
-    });
-
-    if (!response.ok) {
-      throw new Error(`AI provider returned HTTP ${response.status}`);
-    }
-
-    const data = await response.json();
-    const content = data?.choices?.[0]?.message?.content;
-    if (!content) throw new Error("AI provider returned no message content");
-    return validateAiAgentAction(parseAiJsonObject(content));
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function requestAiTerminalCommand(settings, prompt, context, timeoutMs) {
-  if (!settings.enabled) throw new Error("AI integration is disabled");
-  if (!settings.apiKey) throw new Error("AI API key is not configured");
-  if (!String(prompt || "").trim()) throw new Error("Prompt is required");
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const response = await fetch(getAiChatCompletionsUrl(settings.baseUrl), {
-      method: "POST",
-      signal: controller.signal,
-      redirect: "error",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${settings.apiKey}`,
-      },
-      body: JSON.stringify({
-        model: settings.model,
-        messages: buildAiMessages(prompt, context),
-        temperature: 0.1,
-        response_format: { type: "json_object" },
-      }),
-    });
-
-    if (!response.ok) {
-      throw new Error(`AI provider returned HTTP ${response.status}`);
-    }
-
-    const data = await response.json();
-    const content = data?.choices?.[0]?.message?.content;
-    if (!content) throw new Error("AI provider returned no message content");
-
-    const parsed = parseAiJsonObject(content);
-    const command = validateGeneratedAiCommand(parsed.command);
-    const modelWarnings = Array.isArray(parsed.warnings)
-      ? parsed.warnings.filter((warning) => typeof warning === "string")
-      : [];
-
-    return {
-      command,
-      explanation:
-        typeof parsed.explanation === "string" ? parsed.explanation.trim() : "",
-      warnings: Array.from(
-        new Set([...modelWarnings, ...getAiCommandWarnings(command)]),
-      ),
-    };
-  } finally {
-    clearTimeout(timeout);
-  }
 }
 
 function createManagedTempFile(fileName, content, encoding = "utf8") {
@@ -1551,6 +1119,35 @@ function reapOrphanedBackendProcess() {
   }
 }
 
+const DEFAULT_BACKEND_PORT = 30001;
+let backendPort = DEFAULT_BACKEND_PORT;
+
+function canListenOn(port) {
+  return new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.once("error", () => resolve(null));
+    probe.listen(port, "127.0.0.1", () => {
+      const { port: bound } = probe.address();
+      probe.close(() => resolve(bound));
+    });
+  });
+}
+
+// 30001 when it is free, otherwise any free port. Only the desktop app talks
+// to this backend, so the number itself does not matter.
+async function findBackendPort() {
+  const preferred = await canListenOn(DEFAULT_BACKEND_PORT);
+  if (preferred) return preferred;
+  const fallback = await canListenOn(0);
+  if (fallback) {
+    logToFile(
+      `Port ${DEFAULT_BACKEND_PORT} is in use, starting the backend on ${fallback}`,
+    );
+    return fallback;
+  }
+  return DEFAULT_BACKEND_PORT;
+}
+
 function startBackendServer() {
   reapOrphanedBackendProcess();
   backendFailure = null;
@@ -1591,7 +1188,8 @@ function startBackendServer() {
         DATA_DIR: dataDir,
         NODE_ENV: "production",
         ELECTRON_EMBEDDED: "true",
-        PORT: "30001",
+        PORT: String(backendPort),
+        EMBEDDED_BACKEND_PORT: String(backendPort),
         VERSION: app.getVersion(),
       },
       stdio: ["pipe", "pipe", "pipe", "ipc"],
@@ -1856,6 +1454,7 @@ function createWindow() {
       sandbox: true,
       webSecurity: true,
       preload: path.join(__dirname, "preload.js"),
+      additionalArguments: [`--termix-backend-port=${backendPort}`],
       partition: termixSessionPartition,
       allowRunningInsecureContent: false,
       webviewTag: false,
@@ -2098,6 +1697,12 @@ ipcMain.handle("get-embedded-server-status", () => {
 ipcMain.handle(
   "external-browser-login",
   async (_event, authUrl, callbackPort) => {
+    if (!isExternalLoginUrl(authUrl)) {
+      return { success: false, error: "Invalid authentication URL" };
+    }
+    if (!isCallbackPort(callbackPort)) {
+      return { success: false, error: "Invalid callback port" };
+    }
     const http = require("http");
 
     return new Promise((resolve) => {
@@ -2187,6 +1792,65 @@ ipcMain.handle("get-desktop-settings", () => {
 ipcMain.handle("save-desktop-settings", (_event, settings) => {
   return desktopSettings.saveDesktopSettings(settings);
 });
+
+let appUpdater = null;
+
+function startAppUpdater() {
+  const kind = autoUpdates.getInstallKind({
+    platform: process.platform,
+    arch: process.arch,
+    isPackaged: app.isPackaged,
+    mas: !!process.mas,
+    env: process.env,
+    execPath: process.execPath,
+    resourcesPath: process.resourcesPath,
+    exists: (target) => fs.existsSync(target),
+    readFile: (target) => fs.readFileSync(target, "utf8"),
+  });
+  logToFile("Updater install kind:", kind);
+  appUpdater = autoUpdates.createUpdater({
+    currentVersion: app.getVersion(),
+    platform: process.platform,
+    arch: process.arch,
+    kind,
+    getMode: () => desktopSettings.getDesktopSettings().updateMode,
+    saveMode: (mode) =>
+      desktopSettings.saveDesktopSettings({ updateMode: mode }),
+    fetchReleases: async () => {
+      const { net } = require("electron");
+      const response = await net.fetch(autoUpdates.RELEASES_API, {
+        headers: { Accept: "application/vnd.github+json" },
+      });
+      if (!response.ok) {
+        throw new Error(`GitHub releases returned ${response.status}`);
+      }
+      return response.json();
+    },
+    loadAutoUpdater: () => require("electron-updater").autoUpdater,
+    send: (state) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send("desktop-update-state", state);
+      }
+    },
+    log: logToFile,
+    beforeInstall: () => {
+      isQuitting = true;
+    },
+  });
+  appUpdater.start();
+}
+
+ipcMain.handle(
+  "desktop-update-get-state",
+  () => appUpdater?.getState() ?? null,
+);
+ipcMain.handle("desktop-update-check", () => appUpdater?.check() ?? null);
+ipcMain.handle("desktop-update-download", () => appUpdater?.download() ?? null);
+ipcMain.handle("desktop-update-install", () => appUpdater?.install() ?? false);
+ipcMain.handle(
+  "desktop-update-set-mode",
+  (_event, mode) => appUpdater?.setMode(mode) ?? null,
+);
 
 // The server an older version of the app was pointed at, offered again when
 // linking so upgraded installs do not have to look it up.
@@ -2359,6 +2023,16 @@ const c2sTunnelRuntimes = new Map();
 const C2S_WS_HIGH_WATERMARK = 1024 * 1024;
 const C2S_WS_LOW_WATERMARK = 256 * 1024;
 const C2S_STREAM_WRITE_LIMIT = 8 * 1024 * 1024;
+
+// A proxy in front of the server may drop an idle WebSocket, which stopped
+// the tunnel. Pings count as traffic.
+function keepC2SSocketAlive(ws) {
+  const timer = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) ws.ping();
+  }, 25_000);
+  timer.unref?.();
+  ws.once("close", () => clearInterval(timer));
+}
 
 // C2S (client-to-server) tunnels relay through the server this desktop is
 // linked to, not the embedded backend.
@@ -2628,6 +2302,7 @@ async function openC2SRelay(
     getWebSocketOptions(relayUrl, { headers }),
   );
   attachC2SAuth(ws, tunnel.name || getC2STunnelName(tunnel));
+  keepC2SSocketAlive(ws);
   const pendingChunks = [];
   let ready = false;
   let closed = false;
@@ -2735,10 +2410,13 @@ async function testC2SRelay(
     getWebSocketOptions(relayUrl, { headers }),
   );
   attachC2SAuth(ws, tunnel.name || getC2STunnelName(tunnel));
+  keepC2SSocketAlive(ws);
 
   if (runtime) runtime.authSocket = ws;
   return new Promise((resolve) => {
     let settled = false;
+    // The relay sends its reason and then closes; keep the reason.
+    let relayError = null;
     const settle = (result) => {
       if (settled) return;
       settled = true;
@@ -2775,6 +2453,10 @@ async function testC2SRelay(
           settle({ success: true });
         } else if (message.type === "error") {
           clearTimeout(timer);
+          relayError = normalizeC2SErrorMessage(
+            message.error,
+            "Tunnel test failed",
+          );
           settle(createC2SFailure(message.error, "Tunnel test failed"));
         }
       } catch (error) {
@@ -2788,7 +2470,10 @@ async function testC2SRelay(
     });
     ws.on("close", () => {
       if (runtime && c2sTunnelRuntimes.get(tunnel.name) === runtime) {
-        setC2STunnelError(tunnel.name, "Endpoint SSH connection closed");
+        setC2STunnelError(
+          tunnel.name,
+          relayError || "Endpoint SSH connection closed",
+        );
       }
       clearTimeout(timer);
       settle({ success: false, error: "Tunnel test connection closed" });
@@ -3045,6 +2730,7 @@ async function startC2SRemoteTunnel(tunnel, index = 0, authToken) {
     getWebSocketOptions(relayUrl, { headers }),
   );
   attachC2SAuth(ws, tunnel.name || getC2STunnelName(tunnel));
+  keepC2SSocketAlive(ws);
   const sockets = new Map();
   let closed = false;
 
@@ -3519,18 +3205,16 @@ ipcMain.handle("get-c2s-tunnel-preset-default-name", () => {
   return `[${date}] ${computerName} (${platform} ${release})`;
 });
 
+function readSetting(key) {
+  const settingsPath = path.join(app.getPath("userData"), "settings.json");
+  if (!fs.existsSync(settingsPath)) return null;
+  const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+  return settings[key] !== undefined ? settings[key] : null;
+}
+
 ipcMain.handle("get-setting", (event, key) => {
   try {
-    const userDataPath = app.getPath("userData");
-    const settingsPath = path.join(userDataPath, "settings.json");
-
-    if (!fs.existsSync(settingsPath)) {
-      return null;
-    }
-
-    const settingsData = fs.readFileSync(settingsPath, "utf8");
-    const settings = JSON.parse(settingsData);
-    return settings[key] !== undefined ? settings[key] : null;
+    return readSetting(key);
   } catch (error) {
     console.error("Error reading setting:", error);
     return null;
@@ -3538,6 +3222,16 @@ ipcMain.handle("get-setting", (event, key) => {
 });
 
 ipcMain.handle("set-setting", (event, key, value) => {
+  if (typeof key !== "string") {
+    return { success: false, error: "Invalid setting key" };
+  }
+  if (
+    key === EXTERNAL_EDITOR_SETTING &&
+    value &&
+    !dialogChosenPaths.has(value)
+  ) {
+    return { success: false, error: "Choose the editor in the file dialog" };
+  }
   try {
     const userDataPath = app.getPath("userData");
     const settingsPath = path.join(userDataPath, "settings.json");
@@ -3560,295 +3254,6 @@ ipcMain.handle("set-setting", (event, key, value) => {
     return { success: false, error: error.message };
   }
 });
-
-ipcMain.handle("get-ai-settings", () => {
-  try {
-    return {
-      success: true,
-      settings: serializeAiSettings(getStoredAiSettings()),
-    };
-  } catch (error) {
-    return {
-      success: false,
-      error:
-        error instanceof Error ? error.message : "Failed to load AI settings",
-    };
-  }
-});
-
-ipcMain.handle("save-ai-settings", (_event, update) => {
-  try {
-    return {
-      success: true,
-      settings: saveAiSettings(update || {}),
-    };
-  } catch (error) {
-    return {
-      success: false,
-      error:
-        error instanceof Error ? error.message : "Failed to save AI settings",
-    };
-  }
-});
-
-ipcMain.handle("clear-ai-settings", () => {
-  try {
-    writeAiSettingsFile({
-      ...AI_SETTINGS_DEFAULTS,
-      updatedAt: new Date().toISOString(),
-    });
-    return {
-      success: true,
-      settings: serializeAiSettings(getStoredAiSettings()),
-    };
-  } catch (error) {
-    return {
-      success: false,
-      error:
-        error instanceof Error ? error.message : "Failed to clear AI settings",
-    };
-  }
-});
-
-ipcMain.handle("test-ai-settings", async (_event, update) => {
-  try {
-    const current = getStoredAiSettings();
-    const candidate = {
-      ...current,
-      enabled: true,
-      baseUrl:
-        update?.baseUrl !== undefined
-          ? normalizeAiBaseUrl(update.baseUrl)
-          : current.baseUrl,
-      model:
-        update?.model !== undefined
-          ? String(update.model || "").trim()
-          : current.model,
-      includeContext:
-        typeof update?.includeContext === "boolean"
-          ? update.includeContext
-          : current.includeContext,
-      apiKey:
-        typeof update?.apiKey === "string" && update.apiKey.trim()
-          ? update.apiKey.trim()
-          : current.apiKey,
-    };
-    if (!candidate.model) throw new Error("AI model is required");
-    await requestAiTerminalCommand(
-      candidate,
-      "Return a harmless command that prints the current working directory.",
-      {},
-      AI_TEST_TIMEOUT_MS,
-    );
-    return { success: true };
-  } catch (error) {
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : "AI settings test failed",
-    };
-  }
-});
-
-ipcMain.handle("generate-terminal-command", async (_event, payload) => {
-  try {
-    const settings = getStoredAiSettings();
-    const result = await requestAiTerminalCommand(
-      settings,
-      payload?.prompt,
-      settings.includeContext ? payload?.context || {} : {},
-      AI_REQUEST_TIMEOUT_MS,
-    );
-    return { success: true, result };
-  } catch (error) {
-    return {
-      success: false,
-      error:
-        error instanceof Error
-          ? error.message
-          : "Failed to generate terminal command",
-    };
-  }
-});
-
-ipcMain.handle("start-terminal-agent-session", async (_event, payload) => {
-  try {
-    const prompt = String(payload?.prompt || "").trim();
-    if (!prompt) throw new Error("Agent task is required");
-
-    const sessionId = `agent_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-    const session = {
-      id: sessionId,
-      prompt,
-      mode: payload?.mode === "yolo" ? "yolo" : "safe",
-      history: [{ role: "user", text: redactAiText(prompt) }],
-      createdAt: Date.now(),
-    };
-    terminalAgentSessions.set(sessionId, session);
-
-    const action = await requestAiAgentAction(
-      getStoredAiSettings(),
-      session,
-      payload || {},
-      AI_REQUEST_TIMEOUT_MS,
-    );
-    session.history.push({ role: "agent", action });
-
-    return { success: true, sessionId, action };
-  } catch (error) {
-    return {
-      success: false,
-      error:
-        error instanceof Error
-          ? error.message
-          : "Failed to start terminal agent",
-    };
-  }
-});
-
-ipcMain.handle("continue-terminal-agent-session", async (_event, payload) => {
-  try {
-    const sessionId = String(payload?.sessionId || "");
-    const session = terminalAgentSessions.get(sessionId);
-    if (!session) throw new Error("Agent session not found");
-
-    if (
-      typeof payload?.observation === "string" &&
-      payload.observation.trim()
-    ) {
-      session.history.push({
-        role: "terminal",
-        text: redactAiText(payload.observation).slice(-AI_MAX_CONTEXT_LENGTH),
-      });
-    }
-    if (typeof payload?.message === "string" && payload.message.trim()) {
-      session.history.push({
-        role: "user",
-        text: redactAiText(payload.message).slice(0, AI_MAX_PROMPT_LENGTH),
-      });
-    }
-
-    const action = await requestAiAgentAction(
-      getStoredAiSettings(),
-      session,
-      payload || {},
-      AI_REQUEST_TIMEOUT_MS,
-    );
-    session.history.push({ role: "agent", action });
-
-    return { success: true, sessionId, action };
-  } catch (error) {
-    return {
-      success: false,
-      error:
-        error instanceof Error
-          ? error.message
-          : "Failed to continue terminal agent",
-    };
-  }
-});
-
-ipcMain.handle("cancel-terminal-agent-session", (_event, sessionId) => {
-  try {
-    terminalAgentSessions.delete(String(sessionId || ""));
-    return { success: true };
-  } catch (error) {
-    return {
-      success: false,
-      error:
-        error instanceof Error
-          ? error.message
-          : "Failed to cancel terminal agent",
-    };
-  }
-});
-
-ipcMain.handle("get-session-cookie", async (_event, name, targetUrl) => {
-  try {
-    const ses = mainWindow?.webContents?.session;
-    if (!ses) return null;
-    const cookies = await ses.cookies.get({
-      name,
-      ...(targetUrl ? { url: targetUrl } : {}),
-    });
-    const cookie = cookies.find((candidate) =>
-      cookieMatchesUrl(candidate, targetUrl),
-    );
-    return (
-      cookie?.value ||
-      getRememberedElectronAuthCookie(name, targetUrl)?.value ||
-      null
-    );
-  } catch (error) {
-    console.error("Failed to get session cookie:", error);
-    return getRememberedElectronAuthCookie(name, targetUrl)?.value || null;
-  }
-});
-
-function cookieMatchesUrl(cookie, targetUrl) {
-  if (!targetUrl) return true;
-
-  try {
-    const targetHost = new URL(targetUrl).hostname;
-    const cookieDomain = (cookie.domain || "").replace(/^\./, "");
-
-    return (
-      cookieDomain === targetHost ||
-      targetHost.endsWith(`.${cookieDomain}`) ||
-      (!cookieDomain && targetHost === "localhost")
-    );
-  } catch {
-    return true;
-  }
-}
-
-ipcMain.handle(
-  "wait-session-cookie",
-  async (_event, name, targetUrl, previousValue, timeoutMs = 5000) => {
-    const ses = mainWindow?.webContents?.session;
-    if (!ses) return { success: false, error: "No Electron session" };
-
-    const existingCookies = await ses.cookies.get({
-      name,
-      ...(targetUrl ? { url: targetUrl } : {}),
-    });
-    const existingCookie = existingCookies.find((cookie) =>
-      cookieMatchesUrl(cookie, targetUrl),
-    );
-    if (existingCookie?.value && existingCookie.value !== previousValue) {
-      return { success: true, value: existingCookie.value };
-    }
-
-    const rememberedCookie = getRememberedElectronAuthCookie(name, targetUrl);
-    if (rememberedCookie?.value && rememberedCookie.value !== previousValue) {
-      return { success: true, value: rememberedCookie.value };
-    }
-
-    return new Promise((resolve) => {
-      const timeout = setTimeout(() => {
-        ses.cookies.off("changed", onCookieChanged);
-        resolve({ success: false, error: "Timed out waiting for cookie" });
-      }, timeoutMs);
-
-      function onCookieChanged(_event, cookie, _cause, removed) {
-        if (
-          removed ||
-          cookie.name !== name ||
-          !cookie.value ||
-          cookie.value === previousValue ||
-          !cookieMatchesUrl(cookie, targetUrl)
-        ) {
-          return;
-        }
-
-        clearTimeout(timeout);
-        ses.cookies.off("changed", onCookieChanged);
-        resolve({ success: true, value: cookie.value });
-      }
-
-      ses.cookies.on("changed", onCookieChanged);
-    });
-  },
-);
 
 ipcMain.handle("clear-session-cookies", async () => {
   try {
@@ -3977,7 +3382,9 @@ ipcMain.handle("show-save-dialog", async (_event, options) => {
 });
 
 ipcMain.handle("show-open-dialog", async (_event, options) => {
-  return dialog.showOpenDialog(mainWindow, options || {});
+  const result = await dialog.showOpenDialog(mainWindow, options || {});
+  for (const filePath of result.filePaths) dialogChosenPaths.add(filePath);
+  return result;
 });
 
 function toLocalFileType(stat) {
@@ -4300,6 +3707,15 @@ ipcMain.handle("cleanup-temp-file", (_event, tempId) => {
 
 ipcMain.handle("open-external-editor", async (_event, fileData) => {
   try {
+    // The editor comes from the saved setting, never from the caller.
+    const editorPath = readSetting(EXTERNAL_EDITOR_SETTING) || null;
+    if (!editorPath && isLaunchableFileName(fileData?.fileName)) {
+      return {
+        success: false,
+        error: "Choose an external editor to open this file type",
+      };
+    }
+
     const result = createManagedTempFile(
       fileData?.fileName,
       fileData?.content,
@@ -4321,10 +3737,6 @@ ipcMain.handle("open-external-editor", async (_event, fileData) => {
       lastMtimeMs: stat.mtimeMs,
     });
 
-    const editorPath =
-      typeof fileData?.editorPath === "string" && fileData.editorPath.trim()
-        ? fileData.editorPath.trim()
-        : null;
     const openError = await openPathWithEditor(result.path, editorPath);
     if (openError) {
       closeExternalEditorSession(editId);
@@ -4428,6 +3840,8 @@ app.whenReady().then(async () => {
   await clearElectronJwtCookiesAtStartup();
 
   if (!isDev) {
+    backendPort = await findBackendPort();
+    setLocalBackendPort(backendPort);
     const result = await startBackendServer();
     logToFile("startBackendServer result:", result);
   } else {
@@ -4441,6 +3855,7 @@ app.whenReady().then(async () => {
 
   createTray();
   createWindow();
+  startAppUpdater();
   desktopSettings.removeOldSyncFiles();
   logToFile("=== Startup complete ===");
 });
