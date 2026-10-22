@@ -38,6 +38,19 @@ contextBridge.exposeInMainWorld("electronAPI", {
   backendPort,
   getAppVersion: () => ipcRenderer.invoke("get-app-version"),
   getPlatform: () => ipcRenderer.invoke("get-platform"),
+
+  // Whether the app-drawn title bar shows in this window, and when it changes
+  // (full screen hides it).
+  getTitleBarVisible: () => ipcRenderer.invoke("get-title-bar-visible"),
+  onTitleBarVisibleChange: (callback) => {
+    const listener = (_event, visible) => callback(visible);
+    ipcRenderer.on("title-bar-visible-changed", listener);
+    return () =>
+      ipcRenderer.removeListener("title-bar-visible-changed", listener);
+  },
+  // Keeps the window controls the system draws in the colors of the theme.
+  setTitleBarOverlay: (colors) =>
+    ipcRenderer.invoke("set-title-bar-overlay", colors),
   getEmbeddedServerStatus: () =>
     ipcRenderer.invoke("get-embedded-server-status"),
   openNativeRdp: (options) => ipcRenderer.invoke("open-native-rdp", options),
@@ -118,32 +131,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
   oidcSystemBrowserAuth: (authUrl, callbackPort) =>
     ipcRenderer.invoke("oidc-system-browser-auth", authUrl, callbackPort),
 
-  openExternalEditor: (fileData) =>
-    ipcRenderer.invoke("open-external-editor", fileData),
-  closeExternalEditor: (editId) =>
-    ipcRenderer.invoke("close-external-editor", editId),
-  onExternalEditorSaved: (callback) => {
-    const listener = (_event, payload) => callback(payload);
-    ipcRenderer.on("external-editor-saved", listener);
-    return () => ipcRenderer.removeListener("external-editor-saved", listener);
-  },
-
   showSaveDialog: (options) => ipcRenderer.invoke("show-save-dialog", options),
   showOpenDialog: (options) => ipcRenderer.invoke("show-open-dialog", options),
-  getLocalHomeDirectory: () => ipcRenderer.invoke("get-local-home-directory"),
-  listLocalDirectory: (dirPath) =>
-    ipcRenderer.invoke("list-local-directory", dirPath),
-  statLocalPaths: (paths) => ipcRenderer.invoke("stat-local-paths", paths),
-  collectLocalFiles: (paths) =>
-    ipcRenderer.invoke("collect-local-files", paths),
-  createLocalFolder: (parentPath, folderName) =>
-    ipcRenderer.invoke("create-local-folder", parentPath, folderName),
-  renameLocalPath: (entryPath, newName) =>
-    ipcRenderer.invoke("rename-local-path", entryPath, newName),
-  trashLocalPath: (entryPath) =>
-    ipcRenderer.invoke("trash-local-path", entryPath),
-  chmodLocalPath: (entryPath, permissions) =>
-    ipcRenderer.invoke("chmod-local-path", entryPath, permissions),
   createTempFile: (fileData) =>
     ipcRenderer.invoke("create-temp-file", fileData),
   createTempFolder: (folderData) =>
@@ -199,12 +188,21 @@ contextBridge.exposeInMainWorld("electronAPI", {
       ipcRenderer.invoke("local-transfer:download", options),
     cancel: (transferId) =>
       ipcRenderer.invoke("local-transfer:cancel", transferId),
-    onProgress: (callback) => {
-      const listener = (_event, payload) => callback(payload);
-      ipcRenderer.on("local-transfer:progress", listener);
-      return () =>
-        ipcRenderer.removeListener("local-transfer:progress", listener);
-    },
+onProgress: (callback) => {
+  const listener = (_event, payload) => callback(payload);
+  ipcRenderer.on("local-transfer:progress", listener);
+  return () =>
+    ipcRenderer.removeListener("local-transfer:progress", listener);
+},
+  },
+  // Native web views placed over an element of the page (WebContentsView).
+  embeddedView: {
+open: (options) => ipcRenderer.invoke("embedded-view-open", options),
+setBounds: (id, bounds) =>
+  ipcRenderer.invoke("embedded-view-bounds", id, bounds),
+setVisible: (id, visible) =>
+  ipcRenderer.invoke("embedded-view-visible", id, visible),
+close: (id) => ipcRenderer.invoke("embedded-view-close", id),
   },
 
   invoke: invokeAllowed,
